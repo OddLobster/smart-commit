@@ -348,7 +348,14 @@ import argparse
 
 
 def _ns(**kwargs):
-    defaults = dict(auto=False, dry_run=False, verbose=None, provider=None)
+    defaults = dict(
+        auto=False,
+        dry_run=False,
+        verbose=None,
+        provider=None,
+        model=None,
+        context=None,
+    )
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
 
@@ -833,6 +840,133 @@ def test_model_completer_explicit_provider_wins(sc, monkeypatch):
     suggestions = sc._model_completer("", ns)
     assert "openai/gpt-5" in suggestions
     assert "claude-sonnet-4-6" not in suggestions
+
+
+# ----------------------------------------------------------------------
+# Developer context
+# ----------------------------------------------------------------------
+
+
+def test_context_in_prompt_when_provided(sc):
+    msg = sc.build_user_message(
+        diff="diff",
+        files=["a.py"],
+        recent_log="abc add foo",
+        conventions="conv",
+        context="added license endpoint, also windows path fix",
+    )
+    assert "## Developer context" in msg
+    assert "added license endpoint, also windows path fix" in msg
+    # Context section appears BEFORE recent commit style and the diff.
+    assert msg.index("## Developer context") < msg.index("## Recent commit style")
+    assert msg.index("## Developer context") < msg.index("## Full diff")
+
+
+def test_context_omitted_when_empty(sc):
+    msg = sc.build_user_message(
+        diff="diff",
+        files=["a.py"],
+        recent_log="",
+        conventions="",
+        context="",
+    )
+    assert "## Developer context" not in msg
+    assert "developer describes" not in msg.lower()
+
+
+def test_context_omitted_when_whitespace_only(sc):
+    msg = sc.build_user_message(
+        diff="d", files=["a"], recent_log="", conventions="", context="   \n  "
+    )
+    assert "## Developer context" not in msg
+
+
+def test_context_priority_cli_wins_over_env(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_CONTEXT", "from env")
+    cfg = sc.build_config(_ns(context=["from cli"]), tmp_path)
+    assert cfg.context == "from cli"
+
+
+def test_context_env_used_when_no_cli(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_CONTEXT", "from env")
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.context == "from env"
+
+
+def test_context_config_baseline_concatenated_with_per_run(sc, tmp_path, monkeypatch):
+    """Config provides a persistent baseline that gets joined with CLI/env per-run."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    (tmp_path / sc.CONFIG_FILENAME).write_text('context = "v2 migration branch"\n')
+    cfg = sc.build_config(_ns(context=["new license endpoint"]), tmp_path)
+    assert cfg.context == "v2 migration branch new license endpoint"
+
+
+def test_context_config_only(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    (tmp_path / sc.CONFIG_FILENAME).write_text('context = "long-running auth rewrite"\n')
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.context == "long-running auth rewrite"
+
+
+def test_context_multiple_cli_flags_concatenate(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    cfg = sc.build_config(_ns(context=["new license endpoint", "windows path fix"]), tmp_path)
+    assert cfg.context == "new license endpoint windows path fix"
+
+
+def test_context_empty_cli_flag_treated_as_no_context(sc, tmp_path, monkeypatch):
+    """`-m ""` is filtered out — falls back to env / config."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_CONTEXT", "fallback")
+    cfg = sc.build_config(_ns(context=["", "  "]), tmp_path)
+    assert cfg.context == "fallback"
+
+
+def test_context_default_is_empty(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.delenv("SMART_COMMIT_CONTEXT", raising=False)
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.context == ""
+
+
+def test_context_cli_parsing_via_argparse(sc):
+    """End-to-end: -m flag is appended into a list and accepts repeated use."""
+    args = sc.parse_args(["-m", "first part", "-m", "second part"])
+    assert args.context == ["first part", "second part"]
+
+
+def test_context_cli_parsing_long_form(sc):
+    args = sc.parse_args(["--context", "single chunk"])
+    assert args.context == ["single chunk"]
+
+
+def test_context_line_appears_in_output(tmp_git_repo, sc, monkeypatch, capsys):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+
+    rc = sc.main(["--auto", "-m", "added license validation"])
+    assert rc == sc.EXIT_OK
+    out = capsys.readouterr().out
+    assert 'Context: "added license validation"' in out
+
+
+def test_context_passed_through_to_prompt(tmp_git_repo, sc, monkeypatch):
+    """Verify the context string actually reaches build_user_message via request_grouping."""
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    captured: dict = {}
+
+    def fake_request_grouping(config, diff, files, recent_log):
+        captured["context"] = config.context
+        return ([sc.CommitGroup(message="feat: a", files=["a.py"])],
+                sc.Usage(input_tokens=1, output_tokens=1, cost_usd=0.0))
+
+    monkeypatch.setattr(sc, "request_grouping", fake_request_grouping)
+    rc = sc.main(["--auto", "-m", "intent here"])
+    assert rc == sc.EXIT_OK
+    assert captured["context"] == "intent here"
 
 
 def test_print_completion_zsh(sc, capsys):
