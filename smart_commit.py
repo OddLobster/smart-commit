@@ -271,11 +271,16 @@ class Spinner:
     """
 
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-    INTERVAL = 0.08
+    DOT_STATES = ("", ".", "..", "...")
+    INTERVAL = 0.08          # seconds per spinner frame (~12.5 fps)
+    DOT_TICKS = 4            # spinner frames per dot transition (~320ms per dot)
     CLEAR_LINE = "\r\x1b[2K"
 
     def __init__(self, message: str, stream=None):
-        self.message = message
+        # The Spinner animates the trailing dots itself, so strip any the
+        # caller already added (and any trailing whitespace). Dots inside
+        # the message are preserved — only a trailing run is removed.
+        self.message = message.rstrip(". ")
         self.stream = stream if stream is not None else sys.stdout
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -302,12 +307,17 @@ class Spinner:
         except (ValueError, OSError):
             pass  # Stream may be closed during shutdown; nothing useful to do.
 
+    def _frame(self, i: int) -> str:
+        spin = self.FRAMES[i % len(self.FRAMES)]
+        dots = self.DOT_STATES[(i // self.DOT_TICKS) % len(self.DOT_STATES)]
+        return f"{spin} {self.message}{dots}"
+
     def _run(self) -> None:
-        for frame in itertools.cycle(self.FRAMES):
+        for i in itertools.count():
             if self._stop.is_set():
                 return
             try:
-                self.stream.write(f"{self.CLEAR_LINE}{frame} {self.message}")
+                self.stream.write(f"{self.CLEAR_LINE}{self._frame(i)}")
                 self.stream.flush()
             except (ValueError, OSError):
                 return
@@ -1365,7 +1375,7 @@ def main(argv: list[str] | None = None) -> int:
     recent_log = git_recent_log()
 
     try:
-        with Spinner(f"Thinking ({model_display_name(config.model)})..."):
+        with Spinner(f"Thinking ({model_display_name(config.model)})"):
             groups, usage = request_grouping(config, diff, staged, recent_log)
     except APICallError as e:
         print(f"error: API call failed: {e}", file=sys.stderr)
