@@ -148,9 +148,12 @@ def test_toml_parse_missing_required(sc):
 # ----------------------------------------------------------------------
 
 
-def _patch_grouping(monkeypatch, sc, groups):
+def _patch_grouping(monkeypatch, sc, groups, usage=None):
+    if usage is None:
+        usage = sc.Usage(input_tokens=1234, output_tokens=567, cost_usd=0.0042)
+
     def fake(config, diff, files, recent_log):
-        return list(groups)
+        return list(groups), usage
 
     monkeypatch.setattr(sc, "request_grouping", fake)
 
@@ -466,12 +469,14 @@ def test_openrouter_request_happy_path(sc, monkeypatch):
         api_key="or-test",
         base_url=sc.OPENROUTER_BASE_URL,
     )
-    items = sc._request_openrouter(cfg, "system text", "user text")
+    items, usage = sc._request_openrouter(cfg, "system text", "user text")
     assert items == [{"message": "feat: x", "files": ["a.py"], "body": "", "reasoning": "r"}]
+    assert isinstance(usage, sc.Usage)
     assert captured["url"].endswith("/chat/completions")
     assert captured["headers"]["Authorization"] == "Bearer or-test"
     assert captured["payload"]["model"] == "anthropic/claude-sonnet-4.5"
     assert captured["payload"]["response_format"]["type"] == "json_schema"
+    assert captured["payload"]["usage"] == {"include": True}
 
 
 def test_openrouter_strips_markdown_fences(sc, monkeypatch):
@@ -513,7 +518,7 @@ def test_openrouter_strips_markdown_fences(sc, monkeypatch):
         api_key="or-test",
         base_url=sc.OPENROUTER_BASE_URL,
     )
-    items = sc._request_openrouter(cfg, "system", "user")
+    items, _usage = sc._request_openrouter(cfg, "system", "user")
     assert items[0]["message"] == "feat: x"
 
 
@@ -563,9 +568,107 @@ def test_openrouter_retries_on_bad_json(sc, monkeypatch):
         api_key="or-test",
         base_url=sc.OPENROUTER_BASE_URL,
     )
-    items = sc._request_openrouter(cfg, "system", "user")
+    items, _usage = sc._request_openrouter(cfg, "system", "user")
     assert calls["n"] == 2
     assert items[0]["files"] == ["b.py"]
+
+
+def test_openrouter_extracts_cost_from_response(sc, monkeypatch):
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            return FakeResponse({
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"commits":[{"message":"x","files":["a"],"body":"","reasoning":"r"}]}'
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 4321,
+                    "completion_tokens": 890,
+                    "cost": 0.00342,
+                },
+            })
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+    cfg = sc.Config(
+        provider=sc.PROVIDER_OPENROUTER,
+        model="some/model",
+        api_key="or-test",
+        base_url=sc.OPENROUTER_BASE_URL,
+    )
+    _items, usage = sc._request_openrouter(cfg, "system", "user")
+    assert usage.input_tokens == 4321
+    assert usage.output_tokens == 890
+    assert usage.cost_usd == pytest.approx(0.00342)
+
+
+def test_openrouter_missing_cost_yields_none(sc, monkeypatch):
+    """When OpenRouter doesn't return cost, usage.cost_usd should be None."""
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            return FakeResponse({
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"commits":[{"message":"x","files":["a"],"body":"","reasoning":"r"}]}'
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+            })
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+    cfg = sc.Config(
+        provider=sc.PROVIDER_OPENROUTER,
+        model="x",
+        api_key="k",
+        base_url=sc.OPENROUTER_BASE_URL,
+    )
+    _items, usage = sc._request_openrouter(cfg, "s", "u")
+    assert usage.input_tokens == 100
+    assert usage.output_tokens == 50
+    assert usage.cost_usd is None
 
 
 def test_openrouter_http_error_raises_apicallerror(sc, monkeypatch):
@@ -598,3 +701,130 @@ def test_openrouter_http_error_raises_apicallerror(sc, monkeypatch):
     )
     with pytest.raises(sc.APICallError):
         sc._request_openrouter(cfg, "system", "user")
+
+
+# ----------------------------------------------------------------------
+# Model aliases + --model flag
+# ----------------------------------------------------------------------
+
+
+def test_resolve_model_aliases_anthropic(sc):
+    assert sc.resolve_model("haiku", sc.PROVIDER_ANTHROPIC) == "claude-haiku-4-5"
+    assert sc.resolve_model("sonnet", sc.PROVIDER_ANTHROPIC) == "claude-sonnet-4-6"
+    assert sc.resolve_model("opus", sc.PROVIDER_ANTHROPIC) == "claude-opus-4-7"
+
+
+def test_resolve_model_aliases_openrouter(sc):
+    assert sc.resolve_model("haiku", sc.PROVIDER_OPENROUTER) == "anthropic/claude-haiku-4.5"
+    assert sc.resolve_model("sonnet", sc.PROVIDER_OPENROUTER) == "anthropic/claude-sonnet-4.5"
+    assert sc.resolve_model("opus", sc.PROVIDER_OPENROUTER) == "anthropic/claude-opus-4.7"
+
+
+def test_resolve_model_passes_unknown_through(sc):
+    assert sc.resolve_model("openai/gpt-5", sc.PROVIDER_OPENROUTER) == "openai/gpt-5"
+    assert sc.resolve_model("claude-haiku-4-5", sc.PROVIDER_ANTHROPIC) == "claude-haiku-4-5"
+
+
+def test_resolve_model_alias_case_insensitive(sc):
+    assert sc.resolve_model("HAIKU", sc.PROVIDER_ANTHROPIC) == "claude-haiku-4-5"
+    assert sc.resolve_model(" Sonnet ", sc.PROVIDER_ANTHROPIC) == "claude-sonnet-4-6"
+
+
+def test_model_cli_flag_wins_over_env(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_MODEL", "claude-opus-4-7")
+    cfg = sc.build_config(_ns(model="haiku"), tmp_path)
+    assert cfg.model == "claude-haiku-4-5"
+
+
+def test_model_env_wins_over_config(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    (tmp_path / sc.CONFIG_FILENAME).write_text('model = "sonnet"\n')
+    monkeypatch.setenv("SMART_COMMIT_MODEL", "haiku")
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.model == "claude-haiku-4-5"
+
+
+def test_model_alias_resolves_against_active_provider(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_PROVIDER", "openrouter")
+    cfg = sc.build_config(_ns(model="opus"), tmp_path)
+    assert cfg.model == "anthropic/claude-opus-4.7"
+
+
+# ----------------------------------------------------------------------
+# Cost / usage formatting
+# ----------------------------------------------------------------------
+
+
+def test_anthropic_cost_known_model(sc):
+    # 4000 in @ $3/M + 1000 out @ $15/M = 0.012 + 0.015 = 0.027
+    assert sc.anthropic_cost("claude-sonnet-4-6", 4000, 1000) == pytest.approx(0.027)
+
+
+def test_anthropic_cost_unknown_model(sc):
+    assert sc.anthropic_cost("not-a-real-model", 1000, 1000) is None
+
+
+def test_fmt_tokens(sc):
+    assert sc.fmt_tokens(42) == "42"
+    assert sc.fmt_tokens(890) == "890"
+    assert sc.fmt_tokens(4200) == "~4.2k"
+    assert sc.fmt_tokens(15000) == "~15k"
+
+
+def test_fmt_cost(sc):
+    assert sc.fmt_cost(None) is None
+    assert sc.fmt_cost(0) == "$0"
+    assert sc.fmt_cost(0.0005) == "<$0.001"
+    assert sc.fmt_cost(0.003) == "$0.003"
+    assert sc.fmt_cost(1.23) == "$1.23"
+    assert sc.fmt_cost(150) == "$150"
+
+
+def test_format_usage_line_with_cost(sc):
+    usage = sc.Usage(input_tokens=4200, output_tokens=890, cost_usd=0.003)
+    assert sc.format_usage_line(usage) == "(~4.2k in · 890 out · $0.003)"
+
+
+def test_format_usage_line_no_cost(sc):
+    usage = sc.Usage(input_tokens=100, output_tokens=50, cost_usd=None)
+    assert sc.format_usage_line(usage) == "(100 in · 50 out)"
+
+
+def test_model_display_name_strips_namespace(sc):
+    assert sc.model_display_name("qwen/qwen3.6-flash") == "qwen3.6-flash"
+    assert sc.model_display_name("openai/gpt-5") == "gpt-5"
+    assert sc.model_display_name("anthropic/claude-sonnet-4.5") == "claude-sonnet-4.5"
+    assert sc.model_display_name("claude-sonnet-4-6") == "claude-sonnet-4-6"
+    assert sc.model_display_name("") == "model"
+
+
+def test_render_plan_uses_model_not_claude(tmp_git_repo, sc, monkeypatch, capsys):
+    """The plan header must reflect the active model, not a hardcoded 'Claude'."""
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+    monkeypatch.setenv("SMART_COMMIT_MODEL", "qwen/qwen3.6-flash")
+
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    out = capsys.readouterr().out
+    assert "qwen3.6-flash suggests" in out
+    assert "Claude suggests" not in out
+
+
+def test_usage_line_appears_in_output(tmp_git_repo, sc, monkeypatch, capsys):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(
+        monkeypatch,
+        sc,
+        groups,
+        usage=sc.Usage(input_tokens=4200, output_tokens=890, cost_usd=0.003),
+    )
+
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    out = capsys.readouterr().out
+    assert "(~4.2k in · 890 out · $0.003)" in out
