@@ -472,7 +472,7 @@ def test_openrouter_request_happy_path(sc, monkeypatch):
 
     cfg = sc.Config(
         provider=sc.PROVIDER_OPENROUTER,
-        model="anthropic/claude-sonnet-4.5",
+        model="anthropic/claude-sonnet-4.6",
         api_key="or-test",
         base_url=sc.OPENROUTER_BASE_URL,
     )
@@ -481,7 +481,7 @@ def test_openrouter_request_happy_path(sc, monkeypatch):
     assert isinstance(usage, sc.Usage)
     assert captured["url"].endswith("/chat/completions")
     assert captured["headers"]["Authorization"] == "Bearer or-test"
-    assert captured["payload"]["model"] == "anthropic/claude-sonnet-4.5"
+    assert captured["payload"]["model"] == "anthropic/claude-sonnet-4.6"
     assert captured["payload"]["response_format"]["type"] == "json_schema"
     # The deprecated `usage: {include: true}` opt-in is no longer sent — cost
     # is always included by OpenRouter automatically.
@@ -675,7 +675,7 @@ def test_openrouter_byok_uses_upstream_inference_cost(sc, monkeypatch):
     monkeypatch.setattr(sc.httpx, "Client", FakeClient)
     cfg = sc.Config(
         provider=sc.PROVIDER_OPENROUTER,
-        model="anthropic/claude-sonnet-4.5",
+        model="anthropic/claude-sonnet-4.6",
         api_key="or-test",
         base_url=sc.OPENROUTER_BASE_URL,
     )
@@ -725,7 +725,7 @@ def test_openrouter_byok_falls_back_to_local_estimate_for_anthropic(sc, monkeypa
         provider=sc.PROVIDER_OPENROUTER,
         # OpenRouter uses dot-separated versions; our local table uses dashes.
         # The fallback should normalize the ID.
-        model="anthropic/claude-sonnet-4.5",
+        model="anthropic/claude-sonnet-4.6",
         api_key="or-test",
         base_url=sc.OPENROUTER_BASE_URL,
     )
@@ -885,7 +885,7 @@ def test_resolve_model_aliases_anthropic(sc):
 
 def test_resolve_model_aliases_openrouter(sc):
     assert sc.resolve_model("haiku", sc.PROVIDER_OPENROUTER) == "anthropic/claude-haiku-4.5"
-    assert sc.resolve_model("sonnet", sc.PROVIDER_OPENROUTER) == "anthropic/claude-sonnet-4.5"
+    assert sc.resolve_model("sonnet", sc.PROVIDER_OPENROUTER) == "anthropic/claude-sonnet-4.6"
     assert sc.resolve_model("opus", sc.PROVIDER_OPENROUTER) == "anthropic/claude-opus-4.7"
 
 
@@ -964,7 +964,7 @@ def test_format_usage_line_no_cost(sc):
 def test_model_display_name_strips_namespace(sc):
     assert sc.model_display_name("qwen/qwen3.6-flash") == "qwen3.6-flash"
     assert sc.model_display_name("openai/gpt-5") == "gpt-5"
-    assert sc.model_display_name("anthropic/claude-sonnet-4.5") == "claude-sonnet-4.5"
+    assert sc.model_display_name("anthropic/claude-sonnet-4.6") == "claude-sonnet-4.6"
     assert sc.model_display_name("claude-sonnet-4-6") == "claude-sonnet-4-6"
     assert sc.model_display_name("") == "model"
 
@@ -990,7 +990,7 @@ def test_model_completer_openrouter_autodetect(sc, monkeypatch):
     ns = argparse.Namespace(provider=None)
     suggestions = sc._model_completer("", ns)
     assert "openai/gpt-5" in suggestions
-    assert "anthropic/claude-sonnet-4.5" in suggestions
+    assert "anthropic/claude-sonnet-4.6" in suggestions
     assert "qwen/qwen3-coder" in suggestions
 
 
