@@ -1,0 +1,336 @@
+"""Unit + integration tests for smart-commit."""
+
+from __future__ import annotations
+
+import io
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from conftest import commit_body, commit_log_subjects, stage_files, staged_files
+
+
+# ----------------------------------------------------------------------
+# Unit tests — pure functions
+# ----------------------------------------------------------------------
+
+
+def test_validate_groups_happy(sc):
+    groups = [
+        sc.CommitGroup(message="feat: x", files=["a.py", "b.py"]),
+        sc.CommitGroup(message="chore: y", files=["c.py"]),
+    ]
+    assert sc.validate_groups(groups, ["a.py", "b.py", "c.py"]) == []
+
+
+def test_validate_groups_duplicate_file(sc):
+    groups = [
+        sc.CommitGroup(message="feat: x", files=["a.py"]),
+        sc.CommitGroup(message="feat: y", files=["a.py"]),
+    ]
+    errors = sc.validate_groups(groups, ["a.py"])
+    assert any("appears in commits 1 and 2" in e for e in errors)
+
+
+def test_validate_groups_unknown_file(sc):
+    groups = [sc.CommitGroup(message="feat: x", files=["a.py", "ghost.py"])]
+    errors = sc.validate_groups(groups, ["a.py"])
+    assert any("'ghost.py' is not in the staged file list" in e for e in errors)
+
+
+def test_validate_groups_unassigned(sc):
+    groups = [sc.CommitGroup(message="feat: x", files=["a.py"])]
+    errors = sc.validate_groups(groups, ["a.py", "b.py"])
+    assert any("Files not in any commit: b.py" in e for e in errors)
+
+
+def test_validate_groups_empty_message(sc):
+    groups = [sc.CommitGroup(message="   ", files=["a.py"])]
+    errors = sc.validate_groups(groups, ["a.py"])
+    assert any("empty message" in e for e in errors)
+
+
+def test_validate_groups_no_files(sc):
+    groups = [sc.CommitGroup(message="feat: x", files=[])]
+    errors = sc.validate_groups(groups, [])
+    assert any("no files" in e for e in errors)
+
+
+def test_truncate_diff_passes_small_through(sc):
+    diff = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -0 +1 @@\n+hello\n"
+    assert sc.truncate_diff(diff) == diff
+
+
+def test_truncate_diff_large_file(sc):
+    body = "+x\n" * 500
+    diff = "diff --git a/big b/big\n--- a/big\n+++ b/big\n@@ -0 +1,500 @@\n" + body
+    out = sc.truncate_diff(diff, max_bytes=100, head_tail=10)
+    assert "[... " in out and "lines truncated ...]" in out
+    assert out.startswith("diff --git a/big b/big")
+
+
+def test_truncate_diff_per_file(sc):
+    a = "diff --git a/a b/a\n" + "+x\n" * 200
+    b = "diff --git a/b b/b\n" + "+y\n" * 200
+    out = sc.truncate_diff(a + b, max_bytes=100, head_tail=10)
+    assert out.count("diff --git") == 2
+    assert out.count("[... ") == 2
+
+
+def test_build_commit_message_subject_only(sc):
+    cfg = sc.Config(verbose_messages=False, trailers=[])
+    g = sc.CommitGroup(message="feat: hello", files=["a.py"], body="ignored")
+    assert sc.build_commit_message(g, cfg) == "feat: hello"
+
+
+def test_build_commit_message_with_body(sc):
+    cfg = sc.Config(verbose_messages=True, trailers=[])
+    g = sc.CommitGroup(
+        message="feat: hello",
+        files=["a.py"],
+        body="A short body that should appear after a blank line.",
+    )
+    msg = sc.build_commit_message(g, cfg)
+    lines = msg.split("\n")
+    assert lines[0] == "feat: hello"
+    assert lines[1] == ""
+    assert "blank line" in msg
+
+
+def test_build_commit_message_with_trailers(sc):
+    cfg = sc.Config(verbose_messages=False, trailers=["Co-authored-by: X <x@example.com>"])
+    g = sc.CommitGroup(message="feat: hello", files=["a.py"])
+    msg = sc.build_commit_message(g, cfg)
+    assert msg == "feat: hello\n\nCo-authored-by: X <x@example.com>"
+
+
+def test_build_commit_message_body_and_trailers(sc):
+    cfg = sc.Config(
+        verbose_messages=True,
+        trailers=["Signed-off-by: A <a@example.com>", "Co-authored-by: B <b@example.com>"],
+    )
+    g = sc.CommitGroup(message="feat: x", files=["a.py"], body="why and what")
+    msg = sc.build_commit_message(g, cfg)
+    parts = msg.split("\n\n")
+    assert parts[0] == "feat: x"
+    assert "why and what" in parts[1]
+    assert parts[2] == "Signed-off-by: A <a@example.com>\nCo-authored-by: B <b@example.com>"
+
+
+def test_toml_roundtrip(sc):
+    groups = [
+        sc.CommitGroup(
+            message='feat(api): "quoted" thing',
+            files=["a/b.py", "c.py"],
+            body="line one\nline two",
+            reasoning="because",
+        ),
+        sc.CommitGroup(message="chore: x", files=["d.py"], body="", reasoning="r"),
+    ]
+    text = sc.groups_to_toml(groups)
+    parsed = sc.parse_toml_plan(text)
+    assert len(parsed) == 2
+    assert parsed[0].message == 'feat(api): "quoted" thing'
+    assert parsed[0].body == "line one\nline two"
+    assert parsed[0].files == ["a/b.py", "c.py"]
+    assert parsed[1].message == "chore: x"
+    assert parsed[1].body == ""
+
+
+def test_toml_parse_missing_required(sc):
+    with pytest.raises(ValueError):
+        sc.parse_toml_plan('[[commit]]\nmessage = "x"\n')  # no files
+
+
+# ----------------------------------------------------------------------
+# Integration tests — real git, mocked Claude
+# ----------------------------------------------------------------------
+
+
+def _patch_grouping(monkeypatch, sc, groups):
+    def fake(client, config, diff, files, recent_log):
+        return list(groups)
+
+    monkeypatch.setattr(sc, "request_grouping", fake)
+
+
+def test_happy_path_two_groups(tmp_git_repo, sc, monkeypatch, capsys):
+    stage_files(tmp_git_repo, {
+        "feature.py": "def f(): pass\n",
+        "feature_test.py": "def test_f(): pass\n",
+        "ci.yml": "ci: yes\n",
+    })
+    groups = [
+        sc.CommitGroup(message="feat: add feature", files=["feature.py", "feature_test.py"]),
+        sc.CommitGroup(message="chore: add ci config", files=["ci.yml"]),
+    ]
+    _patch_grouping(monkeypatch, sc, groups)
+    monkeypatch.setattr("builtins.input", lambda *_: "a")
+
+    rc = sc.main([])
+    assert rc == sc.EXIT_OK
+
+    subjects = commit_log_subjects(tmp_git_repo)
+    assert subjects[:2] == ["chore: add ci config", "feat: add feature"]
+    assert staged_files(tmp_git_repo) == []
+
+
+def test_dry_run_makes_no_commits(tmp_git_repo, sc, monkeypatch):
+    stage_files(tmp_git_repo, {"a.py": "1\n", "b.py": "2\n"})
+    groups = [
+        sc.CommitGroup(message="feat: a", files=["a.py"]),
+        sc.CommitGroup(message="feat: b", files=["b.py"]),
+    ]
+    _patch_grouping(monkeypatch, sc, groups)
+    initial_count = len(commit_log_subjects(tmp_git_repo))
+
+    rc = sc.main(["--dry-run"])
+    assert rc == sc.EXIT_OK
+    assert len(commit_log_subjects(tmp_git_repo)) == initial_count
+    assert sorted(staged_files(tmp_git_repo)) == ["a.py", "b.py"]
+
+
+def test_auto_skips_prompt(tmp_git_repo, sc, monkeypatch):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+
+    def no_input(*_):
+        raise AssertionError("should not be prompted")
+
+    monkeypatch.setattr("builtins.input", no_input)
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    assert "feat: a" in commit_log_subjects(tmp_git_repo)
+
+
+def test_quit_leaves_files_staged(tmp_git_repo, sc, monkeypatch):
+    stage_files(tmp_git_repo, {"a.py": "1\n", "b.py": "2\n"})
+    groups = [
+        sc.CommitGroup(message="feat: a", files=["a.py"]),
+        sc.CommitGroup(message="feat: b", files=["b.py"]),
+    ]
+    _patch_grouping(monkeypatch, sc, groups)
+    monkeypatch.setattr("builtins.input", lambda *_: "q")
+    initial = len(commit_log_subjects(tmp_git_repo))
+
+    rc = sc.main([])
+    assert rc == sc.EXIT_OK
+    assert len(commit_log_subjects(tmp_git_repo)) == initial
+    assert sorted(staged_files(tmp_git_repo)) == ["a.py", "b.py"]
+
+
+def test_validation_failure_aborts_without_committing(tmp_git_repo, sc, monkeypatch, capsys):
+    stage_files(tmp_git_repo, {"a.py": "1\n", "b.py": "2\n"})
+    # Both groups claim a.py — duplicate.
+    groups = [
+        sc.CommitGroup(message="feat: a", files=["a.py"]),
+        sc.CommitGroup(message="feat: b", files=["a.py", "b.py"]),
+    ]
+    _patch_grouping(monkeypatch, sc, groups)
+    monkeypatch.setattr("builtins.input", lambda *_: "q")  # don't enter editor
+    initial = len(commit_log_subjects(tmp_git_repo))
+
+    rc = sc.main([])
+    assert rc == sc.EXIT_VALIDATION_ERROR
+    assert len(commit_log_subjects(tmp_git_repo)) == initial
+    assert sorted(staged_files(tmp_git_repo)) == ["a.py", "b.py"]
+
+
+def test_no_staged_changes_exits_cleanly(tmp_git_repo, sc, monkeypatch):
+    rc = sc.main([])
+    assert rc == sc.EXIT_USER_ERROR
+
+
+def test_missing_api_key(tmp_git_repo, sc, monkeypatch):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    rc = sc.main([])
+    assert rc == sc.EXIT_USER_ERROR
+
+
+def test_merge_in_progress_blocks_run(tmp_git_repo, sc, monkeypatch):
+    # Simulate an in-progress merge by creating MERGE_HEAD in .git/.
+    (tmp_git_repo / ".git" / "MERGE_HEAD").write_text(
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+
+    rc = sc.main([])
+    assert rc == sc.EXIT_USER_ERROR
+
+
+def test_rename_kept_in_one_group(tmp_git_repo, sc, monkeypatch):
+    # Set up: commit a file, then rename it.
+    (tmp_git_repo / "old.py").write_text("hello\n")
+    subprocess.run(["git", "add", "old.py"], cwd=tmp_git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "add old"], cwd=tmp_git_repo, check=True
+    )
+    subprocess.run(
+        ["git", "mv", "old.py", "new.py"], cwd=tmp_git_repo, check=True
+    )
+
+    paths, renames = sc.git_staged_status()
+    assert paths == ["new.py"]
+    assert renames == {"old.py": "new.py"}
+
+    groups = [sc.CommitGroup(message="refactor: rename", files=["new.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+    monkeypatch.setattr("builtins.input", lambda *_: "a")
+
+    rc = sc.main([])
+    assert rc == sc.EXIT_OK
+    assert "refactor: rename" in commit_log_subjects(tmp_git_repo)
+    assert staged_files(tmp_git_repo) == []
+
+
+def test_verbose_writes_body_into_commit(tmp_git_repo, sc, monkeypatch):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [
+        sc.CommitGroup(
+            message="feat: a",
+            files=["a.py"],
+            body="Adds the a module which does the a thing.",
+        )
+    ]
+    _patch_grouping(monkeypatch, sc, groups)
+
+    rc = sc.main(["--verbose", "--auto"])
+    assert rc == sc.EXIT_OK
+    body = commit_body(tmp_git_repo)
+    assert body.startswith("feat: a\n\n")
+    assert "Adds the a module" in body
+
+
+def test_trailers_appended_from_config(tmp_git_repo, sc, monkeypatch):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    (tmp_git_repo / ".smart-commit.toml").write_text(
+        'trailers = ["Co-authored-by: Claude <noreply@anthropic.com>"]\n'
+    )
+    # The config file is unstaged, so it won't appear in staged_files.
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    body = commit_body(tmp_git_repo)
+    assert body.rstrip().endswith("Co-authored-by: Claude <noreply@anthropic.com>")
+
+
+def test_dry_run_wins_over_auto(tmp_git_repo, sc, monkeypatch):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+    initial = len(commit_log_subjects(tmp_git_repo))
+
+    rc = sc.main(["--auto", "--dry-run"])
+    assert rc == sc.EXIT_OK
+    assert len(commit_log_subjects(tmp_git_repo)) == initial
