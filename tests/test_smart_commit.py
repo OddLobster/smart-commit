@@ -800,6 +800,57 @@ def test_model_display_name_strips_namespace(sc):
     assert sc.model_display_name("") == "model"
 
 
+def test_model_completer_anthropic(sc, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("SMART_COMMIT_PROVIDER", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    ns = argparse.Namespace(provider=None)
+    suggestions = sc._model_completer("", ns)
+    assert "haiku" in suggestions
+    assert "sonnet" in suggestions
+    assert "opus" in suggestions
+    assert "claude-sonnet-4-6" in suggestions
+    # Aliases come first so tab cycles them before full IDs
+    assert suggestions.index("haiku") < suggestions.index("claude-sonnet-4-6")
+
+
+def test_model_completer_openrouter_autodetect(sc, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("SMART_COMMIT_PROVIDER", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
+    ns = argparse.Namespace(provider=None)
+    suggestions = sc._model_completer("", ns)
+    assert "openai/gpt-5" in suggestions
+    assert "anthropic/claude-sonnet-4.5" in suggestions
+    assert "qwen/qwen3-coder" in suggestions
+
+
+def test_model_completer_explicit_provider_wins(sc, monkeypatch):
+    """When --provider is on the command line, it overrides env-based auto-detect."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    ns = argparse.Namespace(provider="openrouter")
+    suggestions = sc._model_completer("", ns)
+    assert "openai/gpt-5" in suggestions
+    assert "claude-sonnet-4-6" not in suggestions
+
+
+def test_print_completion_zsh(sc, capsys):
+    rc = sc.main(["--print-completion", "zsh"])
+    assert rc == sc.EXIT_OK
+    out = capsys.readouterr().out
+    # argcomplete's zsh shellcode includes bashcompinit and references the program name
+    assert "smart-commit" in out
+    assert len(out) > 100  # non-trivial script
+
+
+def test_print_completion_bash(sc, capsys):
+    rc = sc.main(["--print-completion", "bash"])
+    assert rc == sc.EXIT_OK
+    out = capsys.readouterr().out
+    assert "smart-commit" in out
+
+
 def test_render_plan_uses_model_not_claude(tmp_git_repo, sc, monkeypatch, capsys):
     """The plan header must reflect the active model, not a hardcoded 'Claude'."""
     stage_files(tmp_git_repo, {"a.py": "1\n"})
