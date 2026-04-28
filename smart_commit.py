@@ -1,9 +1,9 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["anthropic>=0.40"]
+# dependencies = ["anthropic>=0.40", "httpx>=0.27"]
 # ///
-"""smart-commit: split staged git changes into atomic commits using Claude."""
+"""smart-commit: split staged git changes into atomic commits using an LLM."""
 
 from __future__ import annotations
 
@@ -20,12 +20,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import anthropic
+import httpx
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
+PROVIDER_ANTHROPIC = "anthropic"
+PROVIDER_OPENROUTER = "openrouter"
+VALID_PROVIDERS = (PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER)
+
+DEFAULT_MODEL_BY_PROVIDER = {
+    PROVIDER_ANTHROPIC: "claude-sonnet-4-6",
+    PROVIDER_OPENROUTER: "anthropic/claude-sonnet-4.5",
+}
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
 CONFIG_FILENAME = ".smart-commit.toml"
 MAX_DIFF_BYTES = 100_000
 DIFF_HEAD_TAIL_LINES = 50
 MAX_TOKENS = 4096
+HTTP_TIMEOUT_SECONDS = 120.0
 
 EXIT_OK = 0
 EXIT_USER_ERROR = 1
@@ -41,12 +52,19 @@ EXIT_VALIDATION_ERROR = 4
 
 @dataclass
 class Config:
-    model: str = DEFAULT_MODEL
+    provider: str = PROVIDER_ANTHROPIC
+    model: str = ""
+    api_key: str = ""
+    base_url: str = ""
     auto: bool = False
     dry_run: bool = False
     verbose_messages: bool = False
     trailers: list[str] = field(default_factory=list)
     conventions: str = ""
+
+
+class APICallError(RuntimeError):
+    """Provider-agnostic wrapper for API errors."""
 
 
 @dataclass
@@ -200,10 +218,50 @@ def load_config(repo_root: Path) -> dict:
         return {}
 
 
+def _resolve_provider(args: argparse.Namespace, raw: dict) -> str:
+    """Resolve provider from CLI > env > config > auto-detect."""
+    if getattr(args, "provider", None):
+        return args.provider
+    env = os.environ.get("SMART_COMMIT_PROVIDER", "").strip().lower()
+    if env:
+        return env
+    if raw.get("provider"):
+        return str(raw["provider"]).strip().lower()
+    # Auto-detect: if exactly one key is set, use that provider.
+    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
+    if has_openrouter and not has_anthropic:
+        return PROVIDER_OPENROUTER
+    return PROVIDER_ANTHROPIC
+
+
 def build_config(args: argparse.Namespace, repo_root: Path) -> Config:
     raw = load_config(repo_root)
     cfg = Config()
-    cfg.model = os.environ.get("SMART_COMMIT_MODEL", DEFAULT_MODEL)
+
+    cfg.provider = _resolve_provider(args, raw)
+    if cfg.provider not in VALID_PROVIDERS:
+        raise ValueError(
+            f"unknown provider '{cfg.provider}'. Valid: {', '.join(VALID_PROVIDERS)}"
+        )
+
+    cfg.model = (
+        os.environ.get("SMART_COMMIT_MODEL")
+        or str(raw.get("model", "")).strip()
+        or DEFAULT_MODEL_BY_PROVIDER[cfg.provider]
+    )
+
+    if cfg.provider == PROVIDER_ANTHROPIC:
+        cfg.api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        cfg.base_url = ""
+    else:  # openrouter
+        cfg.api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        cfg.base_url = (
+            os.environ.get("SMART_COMMIT_BASE_URL")
+            or str(raw.get("base_url", "")).strip()
+            or OPENROUTER_BASE_URL
+        )
+
     cfg.auto = bool(args.auto) or os.environ.get("SMART_COMMIT_AUTO", "").lower() in ("1", "true", "yes")
     cfg.dry_run = bool(args.dry_run)
     if cfg.dry_run:
@@ -248,6 +306,21 @@ Rules:
 SYSTEM_PROMPT_VERBOSE = '- Set "body" to 1-3 sentences explaining what the change does and why. Add context beyond the subject line.\n'
 SYSTEM_PROMPT_TERSE = '- Leave "body" as an empty string.\n'
 
+SYSTEM_PROMPT_SCHEMA = """
+Respond with a single JSON object matching this schema, and nothing else (no markdown fences, no commentary):
+
+{
+  "commits": [
+    {
+      "message": "feat(api): add license validation endpoint",
+      "files": ["server/routes/license.py", "server/models/license.py"],
+      "body": "",
+      "reasoning": "These files together implement the license check feature."
+    }
+  ]
+}
+"""
+
 
 RESPONSE_SCHEMA = {
     "type": "object",
@@ -273,7 +346,11 @@ RESPONSE_SCHEMA = {
 
 
 def build_system_prompt(verbose: bool) -> str:
-    return SYSTEM_PROMPT_BASE + (SYSTEM_PROMPT_VERBOSE if verbose else SYSTEM_PROMPT_TERSE)
+    return (
+        SYSTEM_PROMPT_BASE
+        + (SYSTEM_PROMPT_VERBOSE if verbose else SYSTEM_PROMPT_TERSE)
+        + SYSTEM_PROMPT_SCHEMA
+    )
 
 
 def build_user_message(diff: str, files: list[str], recent_log: str, conventions: str) -> str:
@@ -287,24 +364,17 @@ def build_user_message(diff: str, files: list[str], recent_log: str, conventions
     return "\n\n".join(parts)
 
 
-def request_grouping(
-    client: anthropic.Anthropic,
-    config: Config,
-    diff: str,
-    files: list[str],
-    recent_log: str,
-) -> list[CommitGroup]:
-    response = client.messages.create(
-        model=config.model,
-        max_tokens=MAX_TOKENS,
-        system=build_system_prompt(config.verbose_messages),
-        messages=[{"role": "user", "content": build_user_message(diff, files, recent_log, config.conventions)}],
-        output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}},
-    )
-    text = "".join(b.text for b in response.content if b.type == "text").strip()
-    data = json.loads(text)
+def _strip_json_fences(text: str) -> str:
+    """Remove markdown ``` / ```json fences if a model adds them despite instructions."""
+    text = text.strip()
+    text = re.sub(r"^```(?:json|JSON)?\s*\n?", "", text)
+    text = re.sub(r"\n?```\s*$", "", text)
+    return text.strip()
+
+
+def _items_to_groups(items: list[dict]) -> list[CommitGroup]:
     groups: list[CommitGroup] = []
-    for item in data["commits"]:
+    for item in items:
         groups.append(
             CommitGroup(
                 message=str(item["message"]).strip(),
@@ -314,6 +384,111 @@ def request_grouping(
             )
         )
     return groups
+
+
+def _request_anthropic(config: Config, system: str, user: str) -> list[dict]:
+    client = anthropic.Anthropic(api_key=config.api_key)
+    try:
+        response = client.messages.create(
+            model=config.model,
+            max_tokens=MAX_TOKENS,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}},
+        )
+    except anthropic.APIError as e:
+        raise APICallError(str(e)) from e
+    text = "".join(b.text for b in response.content if b.type == "text").strip()
+    data = json.loads(text)
+    return list(data["commits"])
+
+
+def _request_openrouter(config: Config, system: str, user: str) -> list[dict]:
+    """Call OpenRouter (or any OpenAI-compatible endpoint) with one parse retry."""
+    headers = {
+        "Authorization": f"Bearer {config.api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/oddlobster/smart-commit",
+        "X-Title": "smart-commit",
+    }
+    messages: list[dict] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    payload = {
+        "model": config.model,
+        "messages": messages,
+        "max_tokens": MAX_TOKENS,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "commits",
+                "strict": True,
+                "schema": RESPONSE_SCHEMA,
+            },
+        },
+    }
+
+    last_error: str | None = None
+    last_text: str | None = None
+    for attempt in range(2):
+        try:
+            with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
+                response = client.post(
+                    f"{config.base_url.rstrip('/')}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:500] if e.response is not None else ""
+            raise APICallError(
+                f"{e.response.status_code} from {config.base_url}: {body}"
+            ) from e
+        except httpx.HTTPError as e:
+            raise APICallError(f"HTTP error talking to {config.base_url}: {e}") from e
+
+        try:
+            text = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise APICallError(f"Unexpected response shape from {config.base_url}: {e}") from e
+        last_text = text
+        cleaned = _strip_json_fences(text)
+        try:
+            parsed = json.loads(cleaned)
+            return list(parsed["commits"])
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            last_error = str(e)
+            if attempt == 0:
+                # Append the bad assistant turn and ask for a clean retry.
+                messages.append({"role": "assistant", "content": text})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response was not valid JSON matching the schema. "
+                        "Respond with ONLY the JSON object, no markdown fences, no commentary."
+                    ),
+                })
+                payload = {**payload, "messages": messages}
+                continue
+    snippet = (last_text or "")[:200].replace("\n", " ")
+    raise APICallError(f"Could not parse JSON from model after retry ({last_error}): {snippet!r}")
+
+
+def request_grouping(
+    config: Config,
+    diff: str,
+    files: list[str],
+    recent_log: str,
+) -> list[CommitGroup]:
+    system = build_system_prompt(config.verbose_messages)
+    user = build_user_message(diff, files, recent_log, config.conventions)
+    if config.provider == PROVIDER_OPENROUTER:
+        items = _request_openrouter(config, system, user)
+    else:
+        items = _request_anthropic(config, system, user)
+    return _items_to_groups(items)
 
 
 # ======================================================================
@@ -611,6 +786,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="Force single-line commit messages (override config).",
     )
+    parser.add_argument(
+        "--provider",
+        choices=VALID_PROVIDERS,
+        default=None,
+        help="Override SMART_COMMIT_PROVIDER for this run (anthropic | openrouter).",
+    )
     return parser.parse_args(argv)
 
 
@@ -628,7 +809,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {in_progress} in progress; resolve it first.", file=sys.stderr)
         return EXIT_USER_ERROR
 
-    config = build_config(args, repo_root)
+    try:
+        config = build_config(args, repo_root)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_USER_ERROR
 
     try:
         staged, rename_pairs = git_staged_status()
@@ -640,26 +825,31 @@ def main(argv: list[str] | None = None) -> int:
         print("Nothing staged. Stage changes first (e.g. `git add ...`).", file=sys.stderr)
         return EXIT_USER_ERROR
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print(
-            "error: ANTHROPIC_API_KEY is not set. "
-            "Get one at https://console.anthropic.com/ and `export ANTHROPIC_API_KEY=...`",
-            file=sys.stderr,
-        )
+    if not config.api_key:
+        if config.provider == PROVIDER_OPENROUTER:
+            print(
+                "error: OPENROUTER_API_KEY is not set. "
+                "Get one at https://openrouter.ai/keys and `export OPENROUTER_API_KEY=...`",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "error: ANTHROPIC_API_KEY is not set. "
+                "Get one at https://console.anthropic.com/ and `export ANTHROPIC_API_KEY=...`",
+                file=sys.stderr,
+            )
         return EXIT_USER_ERROR
 
     n = len(staged)
     suffix = "" if n == 1 else "s"
-    print(f"Analyzing {n} staged file{suffix}...\n")
+    print(f"Analyzing {n} staged file{suffix} via {config.provider} ({config.model})...\n")
 
     diff = truncate_diff(git_staged_diff())
     recent_log = git_recent_log()
 
-    client = anthropic.Anthropic(api_key=api_key)
     try:
-        groups = request_grouping(client, config, diff, staged, recent_log)
-    except anthropic.APIError as e:
+        groups = request_grouping(config, diff, staged, recent_log)
+    except APICallError as e:
         print(f"error: API call failed: {e}", file=sys.stderr)
         return EXIT_API_ERROR
     except (json.JSONDecodeError, KeyError, TypeError) as e:
