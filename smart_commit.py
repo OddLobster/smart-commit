@@ -32,7 +32,7 @@ VALID_PROVIDERS = (PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER)
 
 DEFAULT_MODEL_BY_PROVIDER = {
     PROVIDER_ANTHROPIC: "claude-sonnet-4-6",
-    PROVIDER_OPENROUTER: "anthropic/claude-sonnet-4.5",
+    PROVIDER_OPENROUTER: "anthropic/claude-sonnet-4.6",
 }
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -47,7 +47,7 @@ MODEL_ALIASES: dict[str, dict[str, str]] = {
     },
     PROVIDER_OPENROUTER: {
         "haiku": "anthropic/claude-haiku-4.5",
-        "sonnet": "anthropic/claude-sonnet-4.5",
+        "sonnet": "anthropic/claude-sonnet-4.6",
         "opus": "anthropic/claude-opus-4.7",
     },
 }
@@ -70,18 +70,25 @@ MODEL_COMPLETION_HINTS: dict[str, list[str]] = {
         "sonnet",
         "opus",
         "anthropic/claude-haiku-4.5",
-        "anthropic/claude-sonnet-4.5",
+        "anthropic/claude-sonnet-4.6",
+        "anthropic/claude-opus-4.6",
         "anthropic/claude-opus-4.7",
         "openai/gpt-5",
+        "openai/gpt-5.5",
+        "openai/o4-mini",
         "openai/gpt-4.1",
         "google/gemini-2.5-pro",
         "google/gemini-2.5-flash",
-        "meta-llama/llama-3.3-70b-instruct",
-        "qwen/qwen3-coder",
-        "qwen/qwen3-vl-plus",
+        "google/gemini-3.1-pro-preview",
         "deepseek/deepseek-r1",
+        "deepseek/deepseek-v4-pro",
+        "meta-llama/llama-4-maverick",
+        "qwen/qwen3-coder",
+        "qwen/qwen3-max",
         "x-ai/grok-4",
         "mistralai/mistral-large",
+        "mistralai/devstral-medium",
+        "moonshotai/kimi-k2.6",
     ],
 }
 
