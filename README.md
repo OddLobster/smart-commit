@@ -16,7 +16,7 @@ $ smart-commit
 
 Analyzing 7 staged files...
 
-Claude suggests 3 commits:
+claude-sonnet-4-6 suggests 3 commits:
 
   1. feat(api): add license validation endpoint
      - server/routes/license.py
@@ -29,6 +29,8 @@ Claude suggests 3 commits:
 
   3. chore: update CI config
      - .github/workflows/ci.yml
+
+(~4.2k in · 890 out · $0.003)
 
 [A]ccept all / [E]dit / [Q]uit? a
 
@@ -69,7 +71,7 @@ git sc
 
 ```
 smart-commit [-n | --dry-run] [-y | --auto] [-v | --verbose | --no-verbose]
-             [--provider {anthropic,openrouter}]
+             [--provider {anthropic,openrouter}] [-m MODEL]
 ```
 
 | Flag | Description |
@@ -79,9 +81,48 @@ smart-commit [-n | --dry-run] [-y | --auto] [-v | --verbose | --no-verbose]
 | `-v`, `--verbose` | Generate multi-line commit messages with a body paragraph. |
 | `--no-verbose` | Force single-line messages, overriding `verbose_messages = true` in config. |
 | `--provider` | One-shot override of `SMART_COMMIT_PROVIDER`. |
+| `-m`, `--model` | One-shot model override. Accepts a full ID (`claude-opus-4-7`, `openai/gpt-5`, `qwen/qwen3-vl-plus`) or a short alias (`haiku`, `sonnet`, `opus`) which resolves to the right ID for the active provider. |
 
 `--dry-run` and `--auto` are mutually exclusive; if both are passed, `--dry-run`
 wins (no commits are made).
+
+### Cost & token visibility
+
+Every run prints a one-liner under the plan with the actual usage:
+
+```
+(~4.2k in · 890 out · $0.003)
+```
+
+For Anthropic, cost is computed from a built-in price table for the Claude
+4.x models. For OpenRouter, the script opts into [usage accounting][or-usage]
+and surfaces the actual USD figure OpenRouter charges — works across every
+model they expose. If pricing isn't known (custom Anthropic model, OpenRouter
+endpoint that didn't return cost), the line drops the dollar figure but still
+shows tokens.
+
+[or-usage]: https://openrouter.ai/docs/use-cases/usage-accounting
+
+### Picking a model on the fly
+
+```bash
+smart-commit --model haiku                    # fast / cheap, current provider
+smart-commit --model sonnet                   # default-tier (current provider)
+smart-commit --model opus                     # heaviest, current provider
+smart-commit --provider openrouter --model openai/gpt-5
+smart-commit --provider openrouter --model qwen/qwen3-vl-plus
+```
+
+The aliases `haiku` / `sonnet` / `opus` resolve to provider-specific IDs:
+
+| Alias | Anthropic | OpenRouter |
+|---|---|---|
+| `haiku` | `claude-haiku-4-5` | `anthropic/claude-haiku-4.5` |
+| `sonnet` | `claude-sonnet-4-6` | `anthropic/claude-sonnet-4.5` |
+| `opus` | `claude-opus-4-7` | `anthropic/claude-opus-4.7` |
+
+Anything that isn't an alias is passed through verbatim, so any OpenRouter
+model ID just works.
 
 ## Environment
 

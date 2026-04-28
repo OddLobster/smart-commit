@@ -32,6 +32,33 @@ DEFAULT_MODEL_BY_PROVIDER = {
 }
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
+# Short aliases for the --model flag. Resolve provider-aware so `haiku` Just
+# Works whether the user is on Anthropic direct or via OpenRouter. Anything
+# not in this map (e.g. `openai/gpt-5`, `qwen/qwen3-vl-plus`) passes through.
+MODEL_ALIASES: dict[str, dict[str, str]] = {
+    PROVIDER_ANTHROPIC: {
+        "haiku": "claude-haiku-4-5",
+        "sonnet": "claude-sonnet-4-6",
+        "opus": "claude-opus-4-7",
+    },
+    PROVIDER_OPENROUTER: {
+        "haiku": "anthropic/claude-haiku-4.5",
+        "sonnet": "anthropic/claude-sonnet-4.5",
+        "opus": "anthropic/claude-opus-4.7",
+    },
+}
+
+# Prices in USD per million tokens (input, output). Used only for the
+# Anthropic provider — OpenRouter returns actual cost on the response.
+ANTHROPIC_PRICING: dict[str, tuple[float, float]] = {
+    "claude-opus-4-7": (5.00, 25.00),
+    "claude-opus-4-6": (5.00, 25.00),
+    "claude-opus-4-5": (5.00, 25.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-sonnet-4-5": (3.00, 15.00),
+    "claude-haiku-4-5": (1.00, 5.00),
+}
+
 CONFIG_FILENAME = ".smart-commit.toml"
 MAX_DIFF_BYTES = 100_000
 DIFF_HEAD_TAIL_LINES = 50
@@ -73,6 +100,77 @@ class CommitGroup:
     files: list[str]
     body: str = ""
     reasoning: str = ""
+
+
+@dataclass
+class Usage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float | None = None  # None when pricing is unknown
+
+
+# ======================================================================
+# Model + pricing helpers
+# ======================================================================
+
+
+def resolve_model(name: str, provider: str) -> str:
+    """Expand a short alias (`haiku`, `sonnet`, `opus`) to a provider-specific ID."""
+    if not name:
+        return name
+    aliases = MODEL_ALIASES.get(provider, {})
+    return aliases.get(name.strip().lower(), name)
+
+
+def anthropic_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    """Estimate Anthropic API cost in USD, or None if the model isn't priced here."""
+    price = ANTHROPIC_PRICING.get(model)
+    if price is None:
+        return None
+    in_per_m, out_per_m = price
+    return (input_tokens / 1_000_000) * in_per_m + (output_tokens / 1_000_000) * out_per_m
+
+
+def fmt_tokens(n: int) -> str:
+    if n >= 10_000:
+        return f"~{n / 1000:.0f}k"
+    if n >= 1000:
+        return f"~{n / 1000:.1f}k"
+    return str(n)
+
+
+def fmt_cost(usd: float | None) -> str | None:
+    if usd is None:
+        return None
+    if usd <= 0:
+        return "$0"
+    if usd < 0.001:
+        return "<$0.001"
+    if usd < 1:
+        return f"${usd:.3f}"
+    if usd < 100:
+        return f"${usd:.2f}"
+    return f"${usd:.0f}"
+
+
+def model_display_name(model: str) -> str:
+    """Strip the provider namespace from an OpenRouter-style ID for display."""
+    if not model:
+        return "model"
+    if "/" in model:
+        return model.split("/", 1)[1]
+    return model
+
+
+def format_usage_line(usage: Usage) -> str:
+    parts = [
+        f"{fmt_tokens(usage.input_tokens)} in",
+        f"{fmt_tokens(usage.output_tokens)} out",
+    ]
+    cost = fmt_cost(usage.cost_usd)
+    if cost is not None:
+        parts.append(cost)
+    return "(" + " · ".join(parts) + ")"
 
 
 # ======================================================================
@@ -245,11 +343,13 @@ def build_config(args: argparse.Namespace, repo_root: Path) -> Config:
             f"unknown provider '{cfg.provider}'. Valid: {', '.join(VALID_PROVIDERS)}"
         )
 
-    cfg.model = (
-        os.environ.get("SMART_COMMIT_MODEL")
+    raw_model = (
+        getattr(args, "model", None)
+        or os.environ.get("SMART_COMMIT_MODEL")
         or str(raw.get("model", "")).strip()
         or DEFAULT_MODEL_BY_PROVIDER[cfg.provider]
     )
+    cfg.model = resolve_model(raw_model, cfg.provider)
 
     if cfg.provider == PROVIDER_ANTHROPIC:
         cfg.api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -386,7 +486,7 @@ def _items_to_groups(items: list[dict]) -> list[CommitGroup]:
     return groups
 
 
-def _request_anthropic(config: Config, system: str, user: str) -> list[dict]:
+def _request_anthropic(config: Config, system: str, user: str) -> tuple[list[dict], Usage]:
     client = anthropic.Anthropic(api_key=config.api_key)
     try:
         response = client.messages.create(
@@ -400,10 +500,17 @@ def _request_anthropic(config: Config, system: str, user: str) -> list[dict]:
         raise APICallError(str(e)) from e
     text = "".join(b.text for b in response.content if b.type == "text").strip()
     data = json.loads(text)
-    return list(data["commits"])
+    in_tok = getattr(response.usage, "input_tokens", 0) or 0
+    out_tok = getattr(response.usage, "output_tokens", 0) or 0
+    usage = Usage(
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+        cost_usd=anthropic_cost(config.model, in_tok, out_tok),
+    )
+    return list(data["commits"]), usage
 
 
-def _request_openrouter(config: Config, system: str, user: str) -> list[dict]:
+def _request_openrouter(config: Config, system: str, user: str) -> tuple[list[dict], Usage]:
     """Call OpenRouter (or any OpenAI-compatible endpoint) with one parse retry."""
     headers = {
         "Authorization": f"Bearer {config.api_key}",
@@ -427,10 +534,14 @@ def _request_openrouter(config: Config, system: str, user: str) -> list[dict]:
                 "schema": RESPONSE_SCHEMA,
             },
         },
+        # OpenRouter usage accounting — populates usage.cost on the response.
+        # OpenAI itself ignores this field, so it's safe for pass-through endpoints.
+        "usage": {"include": True},
     }
 
     last_error: str | None = None
     last_text: str | None = None
+    last_data: dict | None = None
     for attempt in range(2):
         try:
             with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
@@ -449,6 +560,7 @@ def _request_openrouter(config: Config, system: str, user: str) -> list[dict]:
         except httpx.HTTPError as e:
             raise APICallError(f"HTTP error talking to {config.base_url}: {e}") from e
 
+        last_data = data
         try:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
@@ -457,7 +569,8 @@ def _request_openrouter(config: Config, system: str, user: str) -> list[dict]:
         cleaned = _strip_json_fences(text)
         try:
             parsed = json.loads(cleaned)
-            return list(parsed["commits"])
+            usage = _openrouter_usage(data)
+            return list(parsed["commits"]), usage
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             last_error = str(e)
             if attempt == 0:
@@ -476,19 +589,32 @@ def _request_openrouter(config: Config, system: str, user: str) -> list[dict]:
     raise APICallError(f"Could not parse JSON from model after retry ({last_error}): {snippet!r}")
 
 
+def _openrouter_usage(data: dict) -> Usage:
+    raw = data.get("usage") or {}
+    in_tok = int(raw.get("prompt_tokens") or 0)
+    out_tok = int(raw.get("completion_tokens") or 0)
+    cost = raw.get("cost")
+    cost_usd: float | None
+    try:
+        cost_usd = float(cost) if cost is not None else None
+    except (TypeError, ValueError):
+        cost_usd = None
+    return Usage(input_tokens=in_tok, output_tokens=out_tok, cost_usd=cost_usd)
+
+
 def request_grouping(
     config: Config,
     diff: str,
     files: list[str],
     recent_log: str,
-) -> list[CommitGroup]:
+) -> tuple[list[CommitGroup], Usage]:
     system = build_system_prompt(config.verbose_messages)
     user = build_user_message(diff, files, recent_log, config.conventions)
     if config.provider == PROVIDER_OPENROUTER:
-        items = _request_openrouter(config, system, user)
+        items, usage = _request_openrouter(config, system, user)
     else:
-        items = _request_anthropic(config, system, user)
-    return _items_to_groups(items)
+        items, usage = _request_anthropic(config, system, user)
+    return _items_to_groups(items), usage
 
 
 # ======================================================================
@@ -524,10 +650,11 @@ def validate_groups(groups: list[CommitGroup], staged: list[str]) -> list[str]:
 # ======================================================================
 
 
-def render_plan(groups: list[CommitGroup], verbose: bool) -> None:
+def render_plan(groups: list[CommitGroup], verbose: bool, model: str = "") -> None:
     n = len(groups)
     suffix = "" if n == 1 else "s"
-    print(f"Claude suggests {n} commit{suffix}:\n")
+    who = model_display_name(model) if model else "model"
+    print(f"{who} suggests {n} commit{suffix}:\n")
     for i, g in enumerate(groups, 1):
         print(f"  {i}. {g.message}")
         if verbose and g.body:
@@ -757,7 +884,7 @@ def execute_plan(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="smart-commit",
-        description="Split staged changes into atomic commits using Claude.",
+        description="Split staged changes into atomic commits using an LLM.",
     )
     parser.add_argument(
         "-n",
@@ -791,6 +918,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=VALID_PROVIDERS,
         default=None,
         help="Override SMART_COMMIT_PROVIDER for this run (anthropic | openrouter).",
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        default=None,
+        help=(
+            "Override the model for this run. Accepts full IDs "
+            "(e.g. 'claude-opus-4-7', 'openai/gpt-5') or short aliases "
+            "('haiku', 'sonnet', 'opus'), which resolve to provider-specific IDs."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -848,7 +985,7 @@ def main(argv: list[str] | None = None) -> int:
     recent_log = git_recent_log()
 
     try:
-        groups = request_grouping(config, diff, staged, recent_log)
+        groups, usage = request_grouping(config, diff, staged, recent_log)
     except APICallError as e:
         print(f"error: API call failed: {e}", file=sys.stderr)
         return EXIT_API_ERROR
@@ -858,7 +995,7 @@ def main(argv: list[str] | None = None) -> int:
 
     errors = validate_groups(groups, staged)
     if errors:
-        print("Validation errors in Claude's plan:", file=sys.stderr)
+        print(f"Validation errors in {model_display_name(config.model)}'s plan:", file=sys.stderr)
         for err in errors:
             print(f"  - {err}", file=sys.stderr)
         if config.auto or config.dry_run:
@@ -876,7 +1013,9 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_VALIDATION_ERROR
         groups = fixed
 
-    render_plan(groups, config.verbose_messages)
+    render_plan(groups, config.verbose_messages, config.model)
+    print(format_usage_line(usage))
+    print()
 
     if config.dry_run:
         print("(dry run — no commits were made)")
@@ -895,7 +1034,7 @@ def main(argv: list[str] | None = None) -> int:
                 if edited is not None:
                     groups = edited
                     print()
-                    render_plan(groups, config.verbose_messages)
+                    render_plan(groups, config.verbose_messages, config.model)
 
     print()
     made, total = execute_plan(groups, staged, rename_pairs, config)
