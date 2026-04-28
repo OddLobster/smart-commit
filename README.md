@@ -218,8 +218,10 @@ Default models:
 
 ## Configuration
 
-Optional `.smart-commit.toml` at the repo root. See `.smart-commit.toml.example`
-for the full schema. Highlights:
+Optional `.smart-commit.toml` at the repo root. Run `smart-commit init` once
+to scaffold a fully-commented starter file (everything opt-in, defaults work
+without it). See `.smart-commit.toml.example` for the full schema reference.
+Highlights:
 
 ```toml
 # provider = "openrouter"          # uncomment to pin the project to OpenRouter

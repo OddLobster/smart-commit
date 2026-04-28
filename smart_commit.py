@@ -95,6 +95,45 @@ ANTHROPIC_PRICING: dict[str, tuple[float, float]] = {
 }
 
 CONFIG_FILENAME = ".smart-commit.toml"
+
+INIT_TEMPLATE = """\
+# smart-commit configuration. All keys are optional — defaults work fine.
+# Full reference: .smart-commit.toml.example in the smart-commit repo.
+
+# --- Provider & model ---------------------------------------------------
+
+# provider = "anthropic"     # or "openrouter"
+# model    = "sonnet"        # alias or full ID. SMART_COMMIT_MODEL env wins.
+
+# --- Per-branch context (optional) --------------------------------------
+
+# Persistent baseline that's prepended to per-run -m / --context strings.
+# Uncomment when this branch has a stable, durable intent.
+# context = "v2 migration: new API routes + DB schema changes"
+
+# --- Prompt customization -----------------------------------------------
+
+# Free-form text injected into the prompt under "## Project conventions".
+# Teach the model your repo's commit-message house style.
+# conventions = \"\"\"
+# We use conventional commits.
+# Scopes: api, ui, infra, docs.
+# Always lowercase. No period at end of subject line.
+# \"\"\"
+
+# --- Commit message style -----------------------------------------------
+
+# When true, generates subject + body per commit. Override per-run with
+# --verbose / --no-verbose.
+# verbose_messages = false
+
+# Trailers appended to every commit message. Common uses:
+#   - Co-authored-by for AI attribution
+#   - Signed-off-by for DCO compliance
+# trailers = [
+#     "Co-authored-by: Claude <noreply@anthropic.com>",
+# ]
+"""
 MAX_DIFF_BYTES = 100_000
 DIFF_HEAD_TAIL_LINES = 50
 MAX_TOKENS = 4096
@@ -969,6 +1008,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Split staged changes into atomic commits using an LLM.",
     )
     parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["init"],
+        default=None,
+        help="Optional subcommand. 'init' scaffolds a .smart-commit.toml at the repo root.",
+    )
+    parser.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
@@ -1041,6 +1087,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def cmd_init(repo_root: Path) -> int:
+    """Scaffold a `.smart-commit.toml` at the repo root."""
+    target = repo_root / CONFIG_FILENAME
+    if target.exists():
+        print(
+            f"{CONFIG_FILENAME} already exists at {target}. Not overwriting.",
+            file=sys.stderr,
+        )
+        return EXIT_USER_ERROR
+    target.write_text(INIT_TEMPLATE)
+    print(f"Created {target}")
+    print(
+        "Edit it to customize provider, model, conventions, trailers, etc. "
+        "All keys are optional — leaving the file empty also silences the setup hint."
+    )
+    return EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -1053,6 +1117,9 @@ def main(argv: list[str] | None = None) -> int:
     except GitError as e:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_USER_ERROR
+
+    if args.command == "init":
+        return cmd_init(repo_root)
 
     in_progress = git_in_progress_state()
     if in_progress:
@@ -1169,6 +1236,13 @@ def main(argv: list[str] | None = None) -> int:
             print()
             for line in log.splitlines():
                 print(f"  {line}")
+
+    # Discoverability hint: nudge users toward a per-repo config when they
+    # don't have one yet. Suppressed by an existing config file (even an
+    # empty one — `touch .smart-commit.toml` works as an opt-out).
+    if made > 0 and not (repo_root / CONFIG_FILENAME).exists():
+        print()
+        print("(tip: `smart-commit init` to customize behavior per-repo)")
 
     return EXIT_OK if made == total else EXIT_GIT_ERROR
 
