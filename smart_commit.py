@@ -182,6 +182,7 @@ class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float | None = None  # None when pricing is unknown
+    estimated: bool = False  # True when cost is derived from a local price table, not the API
 
 
 # ======================================================================
@@ -262,7 +263,9 @@ def format_usage_line(usage: Usage) -> str:
     ]
     cost = fmt_cost(usage.cost_usd)
     if cost is not None:
-        parts.append(cost)
+        # Tilde marks an estimate — cost was derived from a local price table
+        # rather than reported by the provider (e.g. BYOK on Anthropic).
+        parts.append(f"~{cost}" if usage.estimated else cost)
     return "(" + " · ".join(parts) + ")"
 
 
@@ -655,10 +658,9 @@ def _request_openrouter(config: Config, system: str, user: str) -> tuple[list[di
                 "schema": RESPONSE_SCHEMA,
             },
         },
-        # OpenRouter usage accounting — populates usage.cost on the response.
-        # OpenAI itself ignores this field, so it's safe for pass-through endpoints.
-        "usage": {"include": True},
     }
+    # Note: OpenRouter's `usage: {include: true}` and OpenAI's `stream_options:
+    # {include_usage: true}` are now deprecated/no-ops — usage is always returned.
 
     last_error: str | None = None
     last_text: str | None = None
@@ -690,7 +692,7 @@ def _request_openrouter(config: Config, system: str, user: str) -> tuple[list[di
         cleaned = _strip_json_fences(text)
         try:
             parsed = json.loads(cleaned)
-            usage = _openrouter_usage(data)
+            usage = _openrouter_usage(data, model=config.model)
             return list(parsed["commits"]), usage
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             last_error = str(e)
@@ -710,17 +712,61 @@ def _request_openrouter(config: Config, system: str, user: str) -> tuple[list[di
     raise APICallError(f"Could not parse JSON from model after retry ({last_error}): {snippet!r}")
 
 
-def _openrouter_usage(data: dict) -> Usage:
+def _safe_float(v) -> float | None:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _openrouter_usage(data: dict, model: str = "") -> Usage:
+    """Extract usage from an OpenRouter chat-completion response.
+
+    OpenRouter reports cost in two places (per their usage-accounting docs):
+      - `usage.cost`: what OpenRouter charges the user (zero for BYOK and
+        some free-tier promos).
+      - `usage.cost_details.upstream_inference_cost`: present only on BYOK
+        requests — the cost the upstream provider charges.
+
+    Strategy: prefer `cost`, fall back to upstream, then fall back to a
+    local price-table estimate when the model is a Claude one. The
+    `estimated` flag tells the renderer to prefix the value with `~`.
+    """
     raw = data.get("usage") or {}
     in_tok = int(raw.get("prompt_tokens") or 0)
     out_tok = int(raw.get("completion_tokens") or 0)
-    cost = raw.get("cost")
-    cost_usd: float | None
-    try:
-        cost_usd = float(cost) if cost is not None else None
-    except (TypeError, ValueError):
-        cost_usd = None
-    return Usage(input_tokens=in_tok, output_tokens=out_tok, cost_usd=cost_usd)
+
+    reported = _safe_float(raw.get("cost"))
+    details = raw.get("cost_details") or {}
+    upstream = _safe_float(details.get("upstream_inference_cost"))
+
+    if reported is not None and reported > 0:
+        return Usage(input_tokens=in_tok, output_tokens=out_tok, cost_usd=reported)
+    if upstream is not None and upstream > 0:
+        # BYOK: the user paid the upstream, not OpenRouter.
+        return Usage(input_tokens=in_tok, output_tokens=out_tok, cost_usd=upstream)
+
+    # cost is 0 or missing. If the model maps to our Anthropic price table,
+    # estimate locally so the user still sees a number on BYOK / free tiers.
+    if model.startswith("anthropic/"):
+        bare = model.split("/", 1)[1]
+        # OpenRouter uses dot-separated versions ("claude-sonnet-4.5"), our
+        # table uses dashes ("claude-sonnet-4-5"). Try both.
+        for candidate in (bare.replace(".", "-"), bare):
+            est = anthropic_cost(candidate, in_tok, out_tok)
+            if est is not None and est > 0:
+                return Usage(
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    cost_usd=est,
+                    estimated=True,
+                )
+
+    # cost is genuinely zero (or unknown). Surface tokens only —
+    # `cost_usd=None` makes fmt_cost return None and the dollar figure drops.
+    return Usage(input_tokens=in_tok, output_tokens=out_tok, cost_usd=None)
 
 
 def request_grouping(
