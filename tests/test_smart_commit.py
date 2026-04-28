@@ -1005,6 +1005,87 @@ def test_model_completer_explicit_provider_wins(sc, monkeypatch):
 
 
 # ----------------------------------------------------------------------
+# Spinner
+# ----------------------------------------------------------------------
+
+
+class _FakeTTY:
+    """Stream that quacks like a TTY and captures writes."""
+
+    def __init__(self):
+        self.buf = []
+
+    def write(self, s):
+        self.buf.append(s)
+        return len(s)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return True
+
+
+class _FakeNonTTY:
+    def __init__(self):
+        self.buf = []
+
+    def write(self, s):
+        self.buf.append(s)
+        return len(s)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def test_spinner_disabled_when_not_tty(sc, monkeypatch):
+    monkeypatch.delenv("SMART_COMMIT_NO_SPINNER", raising=False)
+    stream = _FakeNonTTY()
+    with sc.Spinner("hello", stream=stream):
+        pass
+    assert stream.buf == []  # nothing written, including no clear sequence
+
+
+def test_spinner_disabled_via_env(sc, monkeypatch):
+    monkeypatch.setenv("SMART_COMMIT_NO_SPINNER", "1")
+    stream = _FakeTTY()
+    with sc.Spinner("hello", stream=stream):
+        pass
+    assert stream.buf == []
+
+
+def test_spinner_runs_when_tty(sc, monkeypatch):
+    """Smoke test: with a TTY-like stream, the spinner thread writes at least one frame."""
+    import time
+
+    monkeypatch.delenv("SMART_COMMIT_NO_SPINNER", raising=False)
+    stream = _FakeTTY()
+    with sc.Spinner("doing work", stream=stream):
+        time.sleep(0.15)  # roughly 2 frames at default 80ms cadence
+    output = "".join(stream.buf)
+    # At least one frame char and the message should have been written.
+    assert any(ch in output for ch in sc.Spinner.FRAMES)
+    assert "doing work" in output
+    # Cleanup sequence cleared the line on exit.
+    assert sc.Spinner.CLEAR_LINE in output
+
+
+def test_spinner_cleans_up_on_exception(sc, monkeypatch):
+    monkeypatch.delenv("SMART_COMMIT_NO_SPINNER", raising=False)
+    stream = _FakeTTY()
+    with pytest.raises(RuntimeError):
+        with sc.Spinner("crashing soon", stream=stream):
+            raise RuntimeError("boom")
+    output = "".join(stream.buf)
+    # The clear sequence must run even on exception so the cursor is parked
+    # on a clean line for the error message that follows.
+    assert sc.Spinner.CLEAR_LINE in output
+
+
+# ----------------------------------------------------------------------
 # `smart-commit init` subcommand
 # ----------------------------------------------------------------------
 
