@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smart-commit"
+version = "0.1.0"
+description = "Split staged git changes into atomic, semantically-distinct commits using Claude."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40",
+]
+
+[project.scripts]
+smart-commit = "smart_commit:main"
+
+[tool.setuptools]
+py-modules = ["smart_commit"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
