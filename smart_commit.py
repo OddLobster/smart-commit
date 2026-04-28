@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -254,6 +256,62 @@ def model_display_name(model: str) -> str:
     if "/" in model:
         return model.split("/", 1)[1]
     return model
+
+
+class Spinner:
+    """Tiny braille spinner that runs in a background thread.
+
+    Self-disables when:
+      - stdout isn't a TTY (pytest's capsys, pipes, redirects), or
+      - SMART_COMMIT_NO_SPINNER is set in the environment.
+
+    Usage:
+        with Spinner("Thinking..."):
+            slow_call()
+    """
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    INTERVAL = 0.08
+    CLEAR_LINE = "\r\x1b[2K"
+
+    def __init__(self, message: str, stream=None):
+        self.message = message
+        self.stream = stream if stream is not None else sys.stdout
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._enabled = (
+            getattr(self.stream, "isatty", lambda: False)()
+            and not os.environ.get("SMART_COMMIT_NO_SPINNER")
+        )
+
+    def __enter__(self) -> "Spinner":
+        if self._enabled:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if not self._enabled:
+            return
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        try:
+            self.stream.write(self.CLEAR_LINE)
+            self.stream.flush()
+        except (ValueError, OSError):
+            pass  # Stream may be closed during shutdown; nothing useful to do.
+
+    def _run(self) -> None:
+        for frame in itertools.cycle(self.FRAMES):
+            if self._stop.is_set():
+                return
+            try:
+                self.stream.write(f"{self.CLEAR_LINE}{frame} {self.message}")
+                self.stream.flush()
+            except (ValueError, OSError):
+                return
+            self._stop.wait(self.INTERVAL)
 
 
 def format_usage_line(usage: Usage) -> str:
@@ -1307,7 +1365,8 @@ def main(argv: list[str] | None = None) -> int:
     recent_log = git_recent_log()
 
     try:
-        groups, usage = request_grouping(config, diff, staged, recent_log)
+        with Spinner(f"Thinking ({model_display_name(config.model)})..."):
+            groups, usage = request_grouping(config, diff, staged, recent_log)
     except APICallError as e:
         print(f"error: API call failed: {e}", file=sys.stderr)
         return EXIT_API_ERROR
