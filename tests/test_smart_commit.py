@@ -483,7 +483,9 @@ def test_openrouter_request_happy_path(sc, monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer or-test"
     assert captured["payload"]["model"] == "anthropic/claude-sonnet-4.5"
     assert captured["payload"]["response_format"]["type"] == "json_schema"
-    assert captured["payload"]["usage"] == {"include": True}
+    # The deprecated `usage: {include: true}` opt-in is no longer sent — cost
+    # is always included by OpenRouter automatically.
+    assert "usage" not in captured["payload"]
 
 
 def test_openrouter_strips_markdown_fences(sc, monkeypatch):
@@ -628,6 +630,166 @@ def test_openrouter_extracts_cost_from_response(sc, monkeypatch):
     assert usage.input_tokens == 4321
     assert usage.output_tokens == 890
     assert usage.cost_usd == pytest.approx(0.00342)
+
+
+def test_openrouter_byok_uses_upstream_inference_cost(sc, monkeypatch):
+    """When OpenRouter reports cost=0 but upstream cost is set (BYOK), use upstream."""
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            return FakeResponse({
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"commits":[{"message":"x","files":["a"],"body":"","reasoning":"r"}]}'
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 3400,
+                    "completion_tokens": 181,
+                    "cost": 0,
+                    "cost_details": {"upstream_inference_cost": 0.0125},
+                },
+            })
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+    cfg = sc.Config(
+        provider=sc.PROVIDER_OPENROUTER,
+        model="anthropic/claude-sonnet-4.5",
+        api_key="or-test",
+        base_url=sc.OPENROUTER_BASE_URL,
+    )
+    _items, usage = sc._request_openrouter(cfg, "system", "user")
+    assert usage.cost_usd == pytest.approx(0.0125)
+    assert usage.estimated is False  # upstream is reported, not estimated
+
+
+def test_openrouter_byok_falls_back_to_local_estimate_for_anthropic(sc, monkeypatch):
+    """BYOK with no upstream cost field: estimate from token counts via the price table."""
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            return FakeResponse({
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"commits":[{"message":"x","files":["a"],"body":"","reasoning":"r"}]}'
+                        }
+                    }
+                ],
+                # cost=0, no cost_details — typical BYOK shape
+                "usage": {"prompt_tokens": 4000, "completion_tokens": 1000, "cost": 0},
+            })
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+    cfg = sc.Config(
+        provider=sc.PROVIDER_OPENROUTER,
+        # OpenRouter uses dot-separated versions; our local table uses dashes.
+        # The fallback should normalize the ID.
+        model="anthropic/claude-sonnet-4.5",
+        api_key="or-test",
+        base_url=sc.OPENROUTER_BASE_URL,
+    )
+    _items, usage = sc._request_openrouter(cfg, "system", "user")
+    # 4000 in @ $3/M + 1000 out @ $15/M = 0.012 + 0.015 = 0.027
+    assert usage.cost_usd == pytest.approx(0.027)
+    assert usage.estimated is True
+
+
+def test_openrouter_zero_cost_non_anthropic_yields_none(sc, monkeypatch):
+    """For non-Anthropic models with cost=0, we have no price table — show no $."""
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            return FakeResponse({
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"commits":[{"message":"x","files":["a"],"body":"","reasoning":"r"}]}'
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "cost": 0},
+            })
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+    cfg = sc.Config(
+        provider=sc.PROVIDER_OPENROUTER,
+        model="qwen/qwen3-coder",
+        api_key="or-test",
+        base_url=sc.OPENROUTER_BASE_URL,
+    )
+    _items, usage = sc._request_openrouter(cfg, "system", "user")
+    assert usage.cost_usd is None
+    assert usage.estimated is False
+
+
+def test_format_usage_line_estimated_prefixes_tilde(sc):
+    usage = sc.Usage(input_tokens=4000, output_tokens=1000, cost_usd=0.027, estimated=True)
+    assert sc.format_usage_line(usage) == "(~4.0k in · ~1.0k out · ~$0.027)"
+
+
+def test_format_usage_line_not_estimated_no_tilde(sc):
+    usage = sc.Usage(input_tokens=4000, output_tokens=1000, cost_usd=0.027, estimated=False)
+    assert sc.format_usage_line(usage) == "(~4.0k in · ~1.0k out · $0.027)"
 
 
 def test_openrouter_missing_cost_yields_none(sc, monkeypatch):
