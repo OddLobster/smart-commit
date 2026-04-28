@@ -843,6 +843,132 @@ def test_model_completer_explicit_provider_wins(sc, monkeypatch):
 
 
 # ----------------------------------------------------------------------
+# `smart-commit init` subcommand
+# ----------------------------------------------------------------------
+
+
+def test_init_creates_config_file(tmp_git_repo, sc, capsys):
+    target = tmp_git_repo / sc.CONFIG_FILENAME
+    assert not target.exists()
+    rc = sc.main(["init"])
+    assert rc == sc.EXIT_OK
+    assert target.exists()
+    out = capsys.readouterr().out
+    assert str(target) in out
+
+
+def test_init_does_not_clobber(tmp_git_repo, sc, capsys):
+    target = tmp_git_repo / sc.CONFIG_FILENAME
+    target.write_text("# my custom config\nverbose_messages = true\n")
+    original = target.read_text()
+
+    rc = sc.main(["init"])
+    assert rc == sc.EXIT_USER_ERROR
+    assert target.read_text() == original
+    err = capsys.readouterr().err
+    assert "already exists" in err
+
+
+def test_init_template_is_valid_toml(tmp_git_repo, sc):
+    """Generated file must parse cleanly with tomllib."""
+    import tomllib
+
+    rc = sc.main(["init"])
+    assert rc == sc.EXIT_OK
+    target = tmp_git_repo / sc.CONFIG_FILENAME
+    parsed = tomllib.loads(target.read_text())
+    # Everything should be commented out → empty dict
+    assert parsed == {}
+
+
+def test_init_template_passes_through_load_config(tmp_git_repo, sc, monkeypatch):
+    """Generated file must round-trip through build_config without errors."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    sc.main(["init"])
+    cfg = sc.build_config(_ns(), tmp_git_repo)
+    # All-commented template should produce default config.
+    assert cfg.context == ""
+    assert cfg.trailers == []
+    assert cfg.verbose_messages is False
+
+
+def test_init_outside_repo_errors(tmp_path, sc, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    rc = sc.main(["init"])
+    assert rc == sc.EXIT_USER_ERROR
+
+
+def test_init_writes_config_at_repo_root_not_cwd(tmp_git_repo, sc, monkeypatch):
+    """init writes to the repo root, even when invoked from a subdirectory."""
+    sub = tmp_git_repo / "deep" / "nested"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    rc = sc.main(["init"])
+    assert rc == sc.EXIT_OK
+    assert (tmp_git_repo / sc.CONFIG_FILENAME).exists()
+    assert not (sub / sc.CONFIG_FILENAME).exists()
+
+
+# ----------------------------------------------------------------------
+# Post-run setup hint
+# ----------------------------------------------------------------------
+
+
+def test_hint_shown_when_no_config(tmp_git_repo, sc, monkeypatch, capsys):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    out = capsys.readouterr().out
+    assert "smart-commit init" in out
+
+
+def test_hint_hidden_when_config_exists(tmp_git_repo, sc, monkeypatch, capsys):
+    (tmp_git_repo / sc.CONFIG_FILENAME).write_text("# custom config\n")
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    out = capsys.readouterr().out
+    assert "smart-commit init" not in out
+
+
+def test_hint_hidden_when_empty_config_exists(tmp_git_repo, sc, monkeypatch, capsys):
+    """An empty .smart-commit.toml is a valid opt-out for the hint."""
+    (tmp_git_repo / sc.CONFIG_FILENAME).touch()
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    out = capsys.readouterr().out
+    assert "smart-commit init" not in out
+
+
+def test_hint_hidden_on_dry_run(tmp_git_repo, sc, monkeypatch, capsys):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+    rc = sc.main(["--dry-run"])
+    assert rc == sc.EXIT_OK
+    out = capsys.readouterr().out
+    assert "smart-commit init" not in out
+
+
+def test_hint_hidden_on_quit(tmp_git_repo, sc, monkeypatch, capsys):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+    monkeypatch.setattr("builtins.input", lambda *_: "q")
+    rc = sc.main([])
+    assert rc == sc.EXIT_OK
+    out = capsys.readouterr().out
+    assert "smart-commit init" not in out
+
+
+# ----------------------------------------------------------------------
 # Developer context
 # ----------------------------------------------------------------------
 
