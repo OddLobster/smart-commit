@@ -1,8 +1,14 @@
 # smart-commit
 
 Replace `git commit` when you have mixed-concern staged changes. `smart-commit`
-asks Claude to group your staged files into semantically distinct commits,
+asks an LLM to group your staged files into semantically distinct commits,
 shows the plan, and (with your approval) executes the commits in order.
+
+Supports two providers out of the box:
+- **Anthropic** (default) — uses the Claude API directly with server-side JSON
+  schema enforcement.
+- **OpenRouter** — pick from any model OpenRouter exposes (Claude, GPT, Gemini,
+  Llama, etc.) via the OpenAI-compatible Chat Completions API.
 
 ```
 $ git add .
@@ -36,9 +42,10 @@ Claude suggests 3 commits:
 ## Requirements
 
 - Python 3.11+
-- [`uv`](https://docs.astral.sh/uv/) (the script declares its dependency on
-  `anthropic` via inline script metadata)
-- An `ANTHROPIC_API_KEY` from <https://console.anthropic.com/>
+- [`uv`](https://docs.astral.sh/uv/)
+- One of:
+  - `ANTHROPIC_API_KEY` from <https://console.anthropic.com/>, or
+  - `OPENROUTER_API_KEY` from <https://openrouter.ai/keys>
 
 ## Install
 
@@ -62,6 +69,7 @@ git sc
 
 ```
 smart-commit [-n | --dry-run] [-y | --auto] [-v | --verbose | --no-verbose]
+             [--provider {anthropic,openrouter}]
 ```
 
 | Flag | Description |
@@ -70,6 +78,7 @@ smart-commit [-n | --dry-run] [-y | --auto] [-v | --verbose | --no-verbose]
 | `-y`, `--auto` | Skip the interactive prompt and execute all commits. Equivalent to `SMART_COMMIT_AUTO=1`. |
 | `-v`, `--verbose` | Generate multi-line commit messages with a body paragraph. |
 | `--no-verbose` | Force single-line messages, overriding `verbose_messages = true` in config. |
+| `--provider` | One-shot override of `SMART_COMMIT_PROVIDER`. |
 
 `--dry-run` and `--auto` are mutually exclusive; if both are passed, `--dry-run`
 wins (no commits are made).
@@ -78,10 +87,17 @@ wins (no commits are made).
 
 | Variable | Default | Notes |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | Required. |
-| `SMART_COMMIT_MODEL` | `claude-sonnet-4-6` | Override the model. |
+| `ANTHROPIC_API_KEY` | — | Required when provider is `anthropic`. |
+| `OPENROUTER_API_KEY` | — | Required when provider is `openrouter`. |
+| `SMART_COMMIT_PROVIDER` | auto-detect | `anthropic` or `openrouter`. Auto-detect uses the API key that is set. |
+| `SMART_COMMIT_MODEL` | provider-specific default | Override the model. |
+| `SMART_COMMIT_BASE_URL` | OpenRouter's URL | Point OpenRouter mode at any OpenAI-compatible endpoint (LiteLLM, Together, …). |
 | `SMART_COMMIT_AUTO` | unset | Truthy values (`1`, `true`, `yes`) imply `--auto`. |
 | `EDITOR` | `vi` | Used for `[E]dit` mode. |
+
+Default models:
+- `anthropic` → `claude-sonnet-4-6`
+- `openrouter` → `anthropic/claude-sonnet-4.5` (override with `SMART_COMMIT_MODEL`, e.g. `openai/gpt-5`, `google/gemini-2.5-pro`, `meta-llama/llama-3.3-70b-instruct`)
 
 ## Configuration
 
@@ -89,6 +105,9 @@ Optional `.smart-commit.toml` at the repo root. See `.smart-commit.toml.example`
 for the full schema. Highlights:
 
 ```toml
+# provider = "openrouter"          # uncomment to pin the project to OpenRouter
+# model    = "openai/gpt-5"        # or pin a specific model
+
 conventions = """
 We use conventional commits.
 Scopes: api, installer, ui, infra, docs.
@@ -97,6 +116,7 @@ verbose_messages = false
 trailers = ["Co-authored-by: Claude <noreply@anthropic.com>"]
 ```
 
+Resolution order: CLI flag > env var > `.smart-commit.toml` > built-in default.
 `verbose_messages` is overridden by `--verbose` / `--no-verbose` for a single
 run. `trailers` is repo-level only — there is no CLI override.
 
