@@ -1010,9 +1010,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["init"],
+        choices=["init", "setup"],
         default=None,
-        help="Optional subcommand. 'init' scaffolds a .smart-commit.toml at the repo root.",
+        help=(
+            "Optional subcommand. "
+            "'init' scaffolds a .smart-commit.toml at the repo root. "
+            "'setup' installs shell tab-completion (bash / zsh / fish)."
+        ),
+    )
+    parser.add_argument(
+        "--shell",
+        choices=["bash", "zsh", "fish"],
+        default=None,
+        help="Override shell auto-detection for the `setup` subcommand.",
     )
     parser.add_argument(
         "-n",
@@ -1087,6 +1097,85 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+SETUP_MARKER_START = "# >>> smart-commit completion (managed by `smart-commit setup`) >>>"
+SETUP_MARKER_END = "# <<< smart-commit completion <<<"
+
+
+def _detect_shell() -> str:
+    """Return the basename of $SHELL, or '' if undetectable."""
+    sh = os.environ.get("SHELL", "")
+    return Path(sh).name if sh else ""
+
+
+def _setup_eval_shell(shell: str) -> int:
+    """Append a guarded eval block to ~/.bashrc or ~/.zshrc. Idempotent."""
+    rc_name = ".zshrc" if shell == "zsh" else ".bashrc"
+    rc_path = Path.home() / rc_name
+    eval_line = f'eval "$(smart-commit --print-completion {shell})"'
+
+    if rc_path.exists():
+        text = rc_path.read_text()
+        if SETUP_MARKER_START in text or eval_line in text:
+            print(f"smart-commit completion is already installed in {rc_path}.")
+            print("(open a new shell to activate, or `source` the file)")
+            return EXIT_OK
+    else:
+        text = ""
+
+    block = "\n".join([
+        "",
+        SETUP_MARKER_START,
+        eval_line,
+        SETUP_MARKER_END,
+        "",
+    ])
+
+    needs_leading_newline = text and not text.endswith("\n")
+    with open(rc_path, "a") as f:
+        if needs_leading_newline:
+            f.write("\n")
+        f.write(block)
+
+    print(f"✓ Added smart-commit completion to {rc_path}")
+    print(f"  Activate now: `source {rc_path}` (or open a new shell)")
+    print("  To remove: delete the block between the smart-commit markers.")
+    return EXIT_OK
+
+
+def _setup_fish() -> int:
+    """Write a dedicated completion file under fish's completions dir."""
+    completions_dir = Path.home() / ".config" / "fish" / "completions"
+    completions_dir.mkdir(parents=True, exist_ok=True)
+    target = completions_dir / "smart-commit.fish"
+    target.write_text(argcomplete.shellcode(["smart-commit"], shell="fish"))
+    print(f"✓ Wrote fish completion to {target}")
+    print("  Activate now: open a new fish shell.")
+    return EXIT_OK
+
+
+def cmd_setup(shell_override: str | None) -> int:
+    """Install shell tab-completion for smart-commit. Idempotent."""
+    shell = shell_override or _detect_shell()
+    if not shell:
+        print(
+            "error: could not detect shell from $SHELL. "
+            "Pass --shell {bash|zsh|fish}.",
+            file=sys.stderr,
+        )
+        return EXIT_USER_ERROR
+    if shell == "fish":
+        return _setup_fish()
+    if shell in ("bash", "zsh"):
+        return _setup_eval_shell(shell)
+    print(
+        f"error: shell '{shell}' isn't supported by automatic setup. "
+        f"Manually add to your shell rc: "
+        f'eval "$(smart-commit --print-completion {shell})"',
+        file=sys.stderr,
+    )
+    return EXIT_USER_ERROR
+
+
 def cmd_init(repo_root: Path) -> int:
     """Scaffold a `.smart-commit.toml` at the repo root."""
     target = repo_root / CONFIG_FILENAME
@@ -1111,6 +1200,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.print_completion:
         print(argcomplete.shellcode(["smart-commit"], shell=args.print_completion))
         return EXIT_OK
+
+    # `setup` doesn't need a git repo — it modifies the user's shell config.
+    if args.command == "setup":
+        return cmd_setup(args.shell)
 
     try:
         repo_root = git_repo_root()
