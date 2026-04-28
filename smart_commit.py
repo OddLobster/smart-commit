@@ -1189,6 +1189,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     model_arg.completer = _model_completer  # type: ignore[attr-defined]
 
+    set_model_arg = parser.add_argument(
+        "--set-model",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Permanently set the model in .smart-commit.toml and exit. "
+            "Accepts the same values as --model."
+        ),
+    )
+    set_model_arg.completer = _model_completer  # type: ignore[attr-defined]
+
     parser.add_argument(
         "-m",
         "--context",
@@ -1297,6 +1308,34 @@ def cmd_setup(shell_override: str | None) -> int:
     return EXIT_USER_ERROR
 
 
+def cmd_set_model(repo_root: Path, raw_model: str) -> int:
+    """Persist *raw_model* into `.smart-commit.toml`."""
+    config_path = repo_root / CONFIG_FILENAME
+
+    # Resolve the alias so the stored value is a concrete model ID.
+    raw = load_config(repo_root)
+    provider = str(raw.get("provider", "")).strip().lower() or PROVIDER_ANTHROPIC
+    if os.environ.get("SMART_COMMIT_PROVIDER"):
+        provider = os.environ["SMART_COMMIT_PROVIDER"].strip().lower()
+    model = resolve_model(raw_model, provider)
+
+    if not config_path.exists():
+        config_path.write_text(f'model = "{model}"\n')
+        print(f"Created {config_path} with model = \"{model}\"")
+        return EXIT_OK
+
+    text = config_path.read_text()
+    # Replace existing model line (commented or not) or append.
+    pattern = re.compile(r"^#?\s*model\s*=\s*.*$", re.MULTILINE)
+    if pattern.search(text):
+        text = pattern.sub(f'model = "{model}"', text, count=1)
+    else:
+        text = text.rstrip("\n") + f'\nmodel = "{model}"\n'
+    config_path.write_text(text)
+    print(f"Saved model = \"{model}\" in {config_path}")
+    return EXIT_OK
+
+
 def cmd_init(repo_root: Path) -> int:
     """Scaffold a `.smart-commit.toml` at the repo root."""
     target = repo_root / CONFIG_FILENAME
@@ -1334,6 +1373,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "init":
         return cmd_init(repo_root)
+
+    if args.set_model:
+        return cmd_set_model(repo_root, args.set_model)
 
     in_progress = git_in_progress_state()
     if in_progress:
