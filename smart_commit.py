@@ -1,7 +1,8 @@
 #!/usr/bin/env -S uv run --script
+# PYTHON_ARGCOMPLETE_OK
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["anthropic>=0.40", "httpx>=0.27"]
+# dependencies = ["anthropic>=0.40", "httpx>=0.27", "argcomplete>=3.0"]
 # ///
 """smart-commit: split staged git changes into atomic commits using an LLM."""
 
@@ -20,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import anthropic
+import argcomplete
 import httpx
 
 PROVIDER_ANTHROPIC = "anthropic"
@@ -46,6 +48,39 @@ MODEL_ALIASES: dict[str, dict[str, str]] = {
         "sonnet": "anthropic/claude-sonnet-4.5",
         "opus": "anthropic/claude-opus-4.7",
     },
+}
+
+# Curated suggestions for shell tab-completion on `--model`. Not authoritative
+# — anything OpenRouter exposes is still a valid value, this is just the list
+# we surface on tab. Aliases come first so `<tab><tab>` short-cycles them.
+MODEL_COMPLETION_HINTS: dict[str, list[str]] = {
+    PROVIDER_ANTHROPIC: [
+        "haiku",
+        "sonnet",
+        "opus",
+        "claude-haiku-4-5",
+        "claude-sonnet-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+    ],
+    PROVIDER_OPENROUTER: [
+        "haiku",
+        "sonnet",
+        "opus",
+        "anthropic/claude-haiku-4.5",
+        "anthropic/claude-sonnet-4.5",
+        "anthropic/claude-opus-4.7",
+        "openai/gpt-5",
+        "openai/gpt-4.1",
+        "google/gemini-2.5-pro",
+        "google/gemini-2.5-flash",
+        "meta-llama/llama-3.3-70b-instruct",
+        "qwen/qwen3-coder",
+        "qwen/qwen3-vl-plus",
+        "deepseek/deepseek-r1",
+        "x-ai/grok-4",
+        "mistralai/mistral-large",
+    ],
 }
 
 # Prices in USD per million tokens (input, output). Used only for the
@@ -120,6 +155,24 @@ def resolve_model(name: str, provider: str) -> str:
         return name
     aliases = MODEL_ALIASES.get(provider, {})
     return aliases.get(name.strip().lower(), name)
+
+
+def _resolve_provider_for_completion(parsed_args) -> str:
+    """Best-effort provider resolution during shell completion (no config-file read)."""
+    p = (
+        getattr(parsed_args, "provider", None)
+        or os.environ.get("SMART_COMMIT_PROVIDER", "").strip().lower()
+    )
+    if p in VALID_PROVIDERS:
+        return p
+    if os.environ.get("OPENROUTER_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
+        return PROVIDER_OPENROUTER
+    return PROVIDER_ANTHROPIC
+
+
+def _model_completer(prefix, parsed_args, **kwargs):  # noqa: ARG001
+    """argcomplete hook for `--model`: suggest provider-appropriate model IDs."""
+    return MODEL_COMPLETION_HINTS[_resolve_provider_for_completion(parsed_args)]
 
 
 def anthropic_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
@@ -919,7 +972,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override SMART_COMMIT_PROVIDER for this run (anthropic | openrouter).",
     )
-    parser.add_argument(
+    model_arg = parser.add_argument(
         "-m",
         "--model",
         default=None,
@@ -929,11 +982,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "('haiku', 'sonnet', 'opus'), which resolve to provider-specific IDs."
         ),
     )
+    model_arg.completer = _model_completer  # type: ignore[attr-defined]
+
+    parser.add_argument(
+        "--print-completion",
+        choices=["bash", "zsh", "fish", "tcsh"],
+        default=None,
+        metavar="SHELL",
+        help=(
+            "Print the shell completion script for the chosen shell and exit. "
+            "Add `eval \"$(smart-commit --print-completion zsh)\"` to your shell rc."
+        ),
+    )
+
+    argcomplete.autocomplete(parser)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    if args.print_completion:
+        print(argcomplete.shellcode(["smart-commit"], shell=args.print_completion))
+        return EXIT_OK
 
     try:
         repo_root = git_repo_root()
