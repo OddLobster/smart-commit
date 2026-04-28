@@ -51,19 +51,26 @@ claude-sonnet-4-6 suggests 3 commits:
 
 ## Install
 
-Pick one:
+```bash
+uv tool install /path/to/smart-commit
+smart-commit setup        # one-shot: installs zsh/bash/fish tab-completion
+```
+
+`setup` auto-detects your shell from `$SHELL`, drops a guarded eval block
+into `~/.zshrc` or `~/.bashrc` (or writes a fish completion file), and is
+idempotent — running it twice does nothing the second time. Override with
+`--shell {bash|zsh|fish}` if needed. Removing the completion is just deleting
+the block between the `# >>> smart-commit completion >>>` / `# <<< … <<<`
+markers.
+
+Other ways to invoke:
 
 ```bash
 # Run directly via uv inline script metadata (no install)
 uv run /path/to/smart-commit/smart_commit.py
 
-# Install as a tool on $PATH (creates `smart-commit` binary)
-uv tool install /path/to/smart-commit
-smart-commit
-
-# Wire up as a git alias against either form above
-git config --global alias.sc '!smart-commit'        # after uv tool install
-git config --global alias.sc '!uv run /path/to/smart-commit/smart_commit.py'
+# As a git alias
+git config --global alias.sc '!smart-commit'
 git sc
 ```
 
@@ -142,9 +149,11 @@ shows tokens.
 
 ### Shell tab-completion
 
-`smart-commit` ships with [argcomplete][]-powered completion. Add one line to
-your shell rc and tab will cycle flags, the `--provider` choices, and a
-curated list of models (provider-aware):
+`smart-commit setup` (run once after install) wires up [argcomplete][]-powered
+completion: tab cycles flags, `--provider` choices, subcommands (`init` /
+`setup`), and a curated provider-aware list of models.
+
+If you'd rather wire it up by hand:
 
 ```bash
 # zsh — add to ~/.zshrc
