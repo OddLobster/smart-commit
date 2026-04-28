@@ -910,6 +910,118 @@ def test_init_writes_config_at_repo_root_not_cwd(tmp_git_repo, sc, monkeypatch):
 
 
 # ----------------------------------------------------------------------
+# `smart-commit setup` (shell completion installer)
+# ----------------------------------------------------------------------
+
+
+def test_setup_zsh_appends_to_zshrc(tmp_path, sc, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    rc = tmp_path / ".zshrc"
+    rc.write_text("# user's existing zshrc\nexport FOO=bar\n")
+
+    rc_pre = rc.read_text()
+    rc = sc.main(["setup"])  # rebinds local 'rc' on purpose? no — keep file ref
+    # Re-resolve since we shadowed: just use the path again.
+    rc_path = tmp_path / ".zshrc"
+    text = rc_path.read_text()
+
+    assert text.startswith(rc_pre)  # existing content preserved
+    assert "smart-commit --print-completion zsh" in text
+    assert sc.SETUP_MARKER_START in text
+    assert sc.SETUP_MARKER_END in text
+
+
+def test_setup_bash_appends_to_bashrc(tmp_path, sc, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    rc_path = tmp_path / ".bashrc"
+    rc_path.write_text("# bash setup\n")
+
+    code = sc.main(["setup"])
+    assert code == sc.EXIT_OK
+    text = rc_path.read_text()
+    assert "smart-commit --print-completion bash" in text
+
+
+def test_setup_creates_rc_if_missing(tmp_path, sc, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    rc_path = tmp_path / ".zshrc"
+    assert not rc_path.exists()
+
+    code = sc.main(["setup"])
+    assert code == sc.EXIT_OK
+    assert rc_path.exists()
+    assert "smart-commit --print-completion zsh" in rc_path.read_text()
+
+
+def test_setup_is_idempotent(tmp_path, sc, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    rc_path = tmp_path / ".zshrc"
+
+    assert sc.main(["setup"]) == sc.EXIT_OK
+    after_first = rc_path.read_text()
+    capsys.readouterr()  # clear
+
+    assert sc.main(["setup"]) == sc.EXIT_OK
+    after_second = rc_path.read_text()
+    assert after_first == after_second  # no duplicate eval block
+
+    out = capsys.readouterr().out
+    assert "already installed" in out
+
+
+def test_setup_fish_writes_completion_file(tmp_path, sc, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+
+    code = sc.main(["setup"])
+    assert code == sc.EXIT_OK
+    target = tmp_path / ".config" / "fish" / "completions" / "smart-commit.fish"
+    assert target.exists()
+    assert "smart-commit" in target.read_text()
+
+
+def test_setup_shell_flag_overrides_detection(tmp_path, sc, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SHELL", "/bin/bash")  # shell says bash...
+    code = sc.main(["setup", "--shell", "zsh"])  # ...but flag says zsh
+    assert code == sc.EXIT_OK
+    assert (tmp_path / ".zshrc").exists()
+    assert not (tmp_path / ".bashrc").exists()
+
+
+def test_setup_unsupported_shell_errors(tmp_path, sc, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SHELL", "/usr/bin/tcsh")
+    code = sc.main(["setup"])
+    assert code == sc.EXIT_USER_ERROR
+    err = capsys.readouterr().err
+    assert "tcsh" in err
+    assert "--print-completion" in err  # tells user the manual fallback
+
+
+def test_setup_no_shell_env_errors(tmp_path, sc, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("SHELL", raising=False)
+    code = sc.main(["setup"])
+    assert code == sc.EXIT_USER_ERROR
+    err = capsys.readouterr().err
+    assert "could not detect shell" in err
+
+
+def test_setup_runs_outside_git_repo(tmp_path, sc, monkeypatch):
+    """setup modifies user shell config — it shouldn't require a git repo."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.chdir(tmp_path)  # plain dir, no .git
+    code = sc.main(["setup"])
+    assert code == sc.EXIT_OK
+
+
+# ----------------------------------------------------------------------
 # Post-run setup hint
 # ----------------------------------------------------------------------
 
