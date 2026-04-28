@@ -149,7 +149,7 @@ def test_toml_parse_missing_required(sc):
 
 
 def _patch_grouping(monkeypatch, sc, groups):
-    def fake(client, config, diff, files, recent_log):
+    def fake(config, diff, files, recent_log):
         return list(groups)
 
     monkeypatch.setattr(sc, "request_grouping", fake)
@@ -334,3 +334,267 @@ def test_dry_run_wins_over_auto(tmp_git_repo, sc, monkeypatch):
     rc = sc.main(["--auto", "--dry-run"])
     assert rc == sc.EXIT_OK
     assert len(commit_log_subjects(tmp_git_repo)) == initial
+
+
+# ----------------------------------------------------------------------
+# Provider resolution + OpenRouter
+# ----------------------------------------------------------------------
+
+
+import argparse
+
+
+def _ns(**kwargs):
+    defaults = dict(auto=False, dry_run=False, verbose=None, provider=None)
+    defaults.update(kwargs)
+    return argparse.Namespace(**defaults)
+
+
+def test_provider_defaults_to_anthropic(sc, tmp_path, monkeypatch):
+    monkeypatch.delenv("SMART_COMMIT_PROVIDER", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.provider == sc.PROVIDER_ANTHROPIC
+    assert cfg.model == sc.DEFAULT_MODEL_BY_PROVIDER[sc.PROVIDER_ANTHROPIC]
+    assert cfg.api_key == "test"
+
+
+def test_provider_autodetect_openrouter(sc, tmp_path, monkeypatch):
+    monkeypatch.delenv("SMART_COMMIT_PROVIDER", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test")
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.provider == sc.PROVIDER_OPENROUTER
+    assert cfg.model == sc.DEFAULT_MODEL_BY_PROVIDER[sc.PROVIDER_OPENROUTER]
+    assert cfg.base_url == sc.OPENROUTER_BASE_URL
+    assert cfg.api_key == "or-test"
+
+
+def test_provider_env_var_wins(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setenv("SMART_COMMIT_PROVIDER", "openrouter")
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.provider == sc.PROVIDER_OPENROUTER
+
+
+def test_provider_cli_flag_wins(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setenv("SMART_COMMIT_PROVIDER", "openrouter")
+    cfg = sc.build_config(_ns(provider="anthropic"), tmp_path)
+    assert cfg.provider == sc.PROVIDER_ANTHROPIC
+
+
+def test_provider_invalid_value_errors(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("SMART_COMMIT_PROVIDER", "made-up")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    with pytest.raises(ValueError):
+        sc.build_config(_ns(), tmp_path)
+
+
+def test_smart_commit_model_env_overrides_default(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_MODEL", "claude-haiku-4-5")
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.model == "claude-haiku-4-5"
+
+
+def test_openrouter_missing_key_message(tmp_git_repo, sc, monkeypatch, capsys):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("SMART_COMMIT_PROVIDER", "openrouter")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    rc = sc.main([])
+    assert rc == sc.EXIT_USER_ERROR
+    err = capsys.readouterr().err
+    assert "OPENROUTER_API_KEY" in err
+
+
+def test_openrouter_request_happy_path(sc, monkeypatch):
+    """Mock httpx and verify the OpenRouter path parses a normal response."""
+    captured: dict = {}
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+        @property
+        def text(self):
+            return json.dumps(self._payload)
+
+        @property
+        def status_code(self):
+            return 200
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["payload"] = json
+            return FakeResponse({
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"commits":[{"message":"feat: x","files":["a.py"],"body":"","reasoning":"r"}]}'
+                        }
+                    }
+                ]
+            })
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+
+    cfg = sc.Config(
+        provider=sc.PROVIDER_OPENROUTER,
+        model="anthropic/claude-sonnet-4.5",
+        api_key="or-test",
+        base_url=sc.OPENROUTER_BASE_URL,
+    )
+    items = sc._request_openrouter(cfg, "system text", "user text")
+    assert items == [{"message": "feat: x", "files": ["a.py"], "body": "", "reasoning": "r"}]
+    assert captured["url"].endswith("/chat/completions")
+    assert captured["headers"]["Authorization"] == "Bearer or-test"
+    assert captured["payload"]["model"] == "anthropic/claude-sonnet-4.5"
+    assert captured["payload"]["response_format"]["type"] == "json_schema"
+
+
+def test_openrouter_strips_markdown_fences(sc, monkeypatch):
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            return FakeResponse({
+                "choices": [
+                    {
+                        "message": {
+                            "content": '```json\n{"commits":[{"message":"feat: x","files":["a.py"],"body":"","reasoning":"r"}]}\n```'
+                        }
+                    }
+                ]
+            })
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+    cfg = sc.Config(
+        provider=sc.PROVIDER_OPENROUTER,
+        model="some/model",
+        api_key="or-test",
+        base_url=sc.OPENROUTER_BASE_URL,
+    )
+    items = sc._request_openrouter(cfg, "system", "user")
+    assert items[0]["message"] == "feat: x"
+
+
+def test_openrouter_retries_on_bad_json(sc, monkeypatch):
+    """First response is unparseable; second is valid. Retry should succeed."""
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    calls = {"n": 0}
+    bad_payload = {"choices": [{"message": {"content": "not json at all, sorry"}}]}
+    good_payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"commits":[{"message":"chore: y","files":["b.py"],"body":"","reasoning":"r"}]}'
+                }
+            }
+        ]
+    }
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            calls["n"] += 1
+            return FakeResponse(bad_payload if calls["n"] == 1 else good_payload)
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+    cfg = sc.Config(
+        provider=sc.PROVIDER_OPENROUTER,
+        model="some/model",
+        api_key="or-test",
+        base_url=sc.OPENROUTER_BASE_URL,
+    )
+    items = sc._request_openrouter(cfg, "system", "user")
+    assert calls["n"] == 2
+    assert items[0]["files"] == ["b.py"]
+
+
+def test_openrouter_http_error_raises_apicallerror(sc, monkeypatch):
+    class FakeResponse:
+        status_code = 401
+        text = "Unauthorized"
+
+        def raise_for_status(self):
+            raise sc.httpx.HTTPStatusError("401", request=None, response=self)
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            return FakeResponse()
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+    cfg = sc.Config(
+        provider=sc.PROVIDER_OPENROUTER,
+        model="some/model",
+        api_key="bad",
+        base_url=sc.OPENROUTER_BASE_URL,
+    )
+    with pytest.raises(sc.APICallError):
+        sc._request_openrouter(cfg, "system", "user")
