@@ -1073,6 +1073,29 @@ def test_spinner_runs_when_tty(sc, monkeypatch):
     assert sc.Spinner.CLEAR_LINE in output
 
 
+def test_spinner_animates_trailing_dots(sc):
+    """Dots cycle through "" / "." / ".." / "..." at DOT_TICKS frames each."""
+    s = sc.Spinner("Thinking", stream=_FakeNonTTY())
+    ticks = sc.Spinner.DOT_TICKS
+    assert s._frame(0).endswith("Thinking")            # i=0 → no dots
+    assert s._frame(ticks).endswith("Thinking.")       # i=DOT_TICKS → 1 dot
+    assert s._frame(2 * ticks).endswith("Thinking..")  # i=2*DOT_TICKS → 2 dots
+    assert s._frame(3 * ticks).endswith("Thinking...") # i=3*DOT_TICKS → 3 dots
+    assert s._frame(4 * ticks).endswith("Thinking")    # wraps back
+
+
+def test_spinner_strips_trailing_dots_from_message(sc):
+    """Caller-supplied trailing dots/spaces are stripped — Spinner owns the animation."""
+    stream = _FakeNonTTY()
+    s = sc.Spinner("Working...", stream=stream)
+    assert s.message == "Working"
+    s2 = sc.Spinner("Working ... ", stream=stream)
+    assert s2.message == "Working"
+    # Dots in the middle of the message are preserved.
+    s3 = sc.Spinner("Doing thing.foo (bar)", stream=stream)
+    assert s3.message == "Doing thing.foo (bar)"
+
+
 def test_spinner_cleans_up_on_exception(sc, monkeypatch):
     monkeypatch.delenv("SMART_COMMIT_NO_SPINNER", raising=False)
     stream = _FakeTTY()
