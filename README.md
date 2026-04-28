@@ -81,10 +81,47 @@ smart-commit [-n | --dry-run] [-y | --auto] [-v | --verbose | --no-verbose]
 | `-v`, `--verbose` | Generate multi-line commit messages with a body paragraph. |
 | `--no-verbose` | Force single-line messages, overriding `verbose_messages = true` in config. |
 | `--provider` | One-shot override of `SMART_COMMIT_PROVIDER`. |
-| `-m`, `--model` | One-shot model override. Accepts a full ID (`claude-opus-4-7`, `openai/gpt-5`, `qwen/qwen3-vl-plus`) or a short alias (`haiku`, `sonnet`, `opus`) which resolves to the right ID for the active provider. |
+| `--model` | One-shot model override. Accepts a full ID (`claude-opus-4-7`, `openai/gpt-5`, `qwen/qwen3-vl-plus`) or a short alias (`haiku`, `sonnet`, `opus`) which resolves to the right ID for the active provider. |
+| `-m`, `--context` | Free-form description of what this session covered (mirrors `git commit -m`). Repeatable; multiple flags are joined with a space. |
 
 `--dry-run` and `--auto` are mutually exclusive; if both are passed, `--dry-run`
 wins (no commits are made).
+
+### Telling the model what you actually did (`-m`)
+
+The single biggest accuracy win on ambiguous diffs is telling the model what
+you were doing in plain English — same idea as `git commit -m`, except the
+context isn't a commit message, it's a *session summary* that helps the
+splitter group correctly:
+
+```bash
+smart-commit -m "added license validation endpoint, also fixed windows path bug"
+smart-commit -m "refactored auth module" -m "unrelated CI fix got mixed in"
+```
+
+The string is injected into the prompt as a "Developer context" section
+ahead of the diff. Multiple `-m` flags are joined with a space (mirrors
+`git commit -m`). The model is told to use this as a *grouping anchor*, not
+a blind instruction — if the diff doesn't support what you said, it won't
+hallucinate groups to match.
+
+When context is active, `smart-commit` echoes it under the analyzing line so
+you can see what the model is being told:
+
+```
+Analyzing 7 staged files via openrouter (qwen/qwen3.6-flash)...
+Context: "added license validation, also fixed windows path bug"
+```
+
+For long-lived feature branches with stable intent, set `context` in
+`.smart-commit.toml` and it becomes a persistent baseline that the per-run
+`-m` flag is appended to. Resolution order:
+
+1. `context` from `.smart-commit.toml` (persistent baseline)
+2. `-m` / `--context` CLI flag, OR `SMART_COMMIT_CONTEXT` env (CLI wins)
+3. Final string = `<config>` + `" "` + `<per-run>`
+
+Sweet spot is 1-3 sentences. Longer hurts more than it helps.
 
 ### Cost & token visibility
 
@@ -171,6 +208,7 @@ model ID just works.
 | `SMART_COMMIT_PROVIDER` | auto-detect | `anthropic` or `openrouter`. Auto-detect uses the API key that is set. |
 | `SMART_COMMIT_MODEL` | provider-specific default | Override the model. |
 | `SMART_COMMIT_BASE_URL` | OpenRouter's URL | Point OpenRouter mode at any OpenAI-compatible endpoint (LiteLLM, Together, …). |
+| `SMART_COMMIT_CONTEXT` | unset | Per-run developer context (same as `-m`). CLI `-m` wins over the env. |
 | `SMART_COMMIT_AUTO` | unset | Truthy values (`1`, `true`, `yes`) imply `--auto`. |
 | `EDITOR` | `vi` | Used for `[E]dit` mode. |
 

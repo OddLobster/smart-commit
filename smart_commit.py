@@ -123,6 +123,7 @@ class Config:
     verbose_messages: bool = False
     trailers: list[str] = field(default_factory=list)
     conventions: str = ""
+    context: str = ""
 
 
 class APICallError(RuntimeError):
@@ -430,6 +431,16 @@ def build_config(args: argparse.Namespace, repo_root: Path) -> Config:
         cfg.trailers = [str(t) for t in trailers if str(t).strip()]
     cfg.conventions = str(raw.get("conventions", ""))
 
+    # Context resolution. The config file is a persistent baseline (e.g. a
+    # long-running feature branch's intent); CLI / env are per-run overlays.
+    # CLI wins over env. Final string = config_baseline + " " + per_run_overlay.
+    config_context = str(raw.get("context", "")).strip()
+    cli_chunks = [c.strip() for c in (getattr(args, "context", None) or []) if c and c.strip()]
+    cli_context = " ".join(cli_chunks)
+    env_context = os.environ.get("SMART_COMMIT_CONTEXT", "").strip()
+    per_run_context = cli_context or env_context
+    cfg.context = " ".join(p for p in (config_context, per_run_context) if p).strip()
+
     if raw.get("colocate") or raw.get("chore_glob"):
         print(
             "warning: 'colocate' and 'chore_glob' config keys are not yet supported.",
@@ -506,8 +517,26 @@ def build_system_prompt(verbose: bool) -> str:
     )
 
 
-def build_user_message(diff: str, files: list[str], recent_log: str, conventions: str) -> str:
+def build_user_message(
+    diff: str,
+    files: list[str],
+    recent_log: str,
+    conventions: str,
+    context: str = "",
+) -> str:
     parts: list[str] = []
+    if context.strip():
+        parts.append(
+            "## Developer context\n"
+            "The developer describes this session:\n"
+            f'"{context.strip()}"\n\n'
+            "Use this to inform your grouping decisions. Files related to the "
+            "same described concern should be grouped together; if the "
+            "developer mentions multiple concerns, use them as grouping "
+            "anchors. Still validate against the actual diff — don't invent "
+            "groups that aren't supported by the changes, and don't drop "
+            "files just because the developer didn't mention them."
+        )
     if recent_log.strip():
         parts.append(f"## Recent commit style\n{recent_log.strip()}")
     if conventions.strip():
@@ -662,7 +691,7 @@ def request_grouping(
     recent_log: str,
 ) -> tuple[list[CommitGroup], Usage]:
     system = build_system_prompt(config.verbose_messages)
-    user = build_user_message(diff, files, recent_log, config.conventions)
+    user = build_user_message(diff, files, recent_log, config.conventions, config.context)
     if config.provider == PROVIDER_OPENROUTER:
         items, usage = _request_openrouter(config, system, user)
     else:
@@ -973,7 +1002,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override SMART_COMMIT_PROVIDER for this run (anthropic | openrouter).",
     )
     model_arg = parser.add_argument(
-        "-m",
         "--model",
         default=None,
         help=(
@@ -983,6 +1011,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     model_arg.completer = _model_completer  # type: ignore[attr-defined]
+
+    parser.add_argument(
+        "-m",
+        "--context",
+        action="append",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Free-form description of what this session covered (mirrors "
+            "`git commit -m`). Can be repeated; multiple flags are joined "
+            "with a space. Dramatically improves grouping accuracy on "
+            "ambiguous diffs. 1-3 sentences is the sweet spot."
+        ),
+    )
 
     parser.add_argument(
         "--print-completion",
@@ -1050,7 +1092,10 @@ def main(argv: list[str] | None = None) -> int:
 
     n = len(staged)
     suffix = "" if n == 1 else "s"
-    print(f"Analyzing {n} staged file{suffix} via {config.provider} ({config.model})...\n")
+    print(f"Analyzing {n} staged file{suffix} via {config.provider} ({config.model})...")
+    if config.context:
+        print(f'Context: "{config.context}"')
+    print()
 
     diff = truncate_diff(git_staged_diff())
     recent_log = git_recent_log()

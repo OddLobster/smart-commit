@@ -15,6 +15,12 @@ model = "qwen/qwen3.6-flash"
 
 # Free-form text injected into the prompt under "## Project conventions".
 # Use this to teach the model your repo's commit-message house style.
+# Persistent context baseline: a one-line description of the branch's intent.
+# Useful for long-lived feature branches where the high-level goal is stable.
+# Per-run context (-m flag or SMART_COMMIT_CONTEXT env) is appended to this.
+# Leave commented out unless this branch has a stable, durable intent.
+# context = "v2 migration: new API routes + DB schema changes"
+
 conventions = """
 We use conventional commits.
 Scopes: api, installer, ui, infra, docs.
