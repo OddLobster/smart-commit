@@ -103,6 +103,44 @@ shows tokens.
 
 [or-usage]: https://openrouter.ai/docs/use-cases/usage-accounting
 
+### Shell tab-completion
+
+`smart-commit` ships with [argcomplete][]-powered completion. Add one line to
+your shell rc and tab will cycle flags, the `--provider` choices, and a
+curated list of models (provider-aware):
+
+```bash
+# zsh — add to ~/.zshrc
+eval "$(smart-commit --print-completion zsh)"
+
+# bash — add to ~/.bashrc
+eval "$(smart-commit --print-completion bash)"
+
+# fish — save once
+smart-commit --print-completion fish > ~/.config/fish/completions/smart-commit.fish
+```
+
+Once active:
+
+```
+$ smart-commit -m <tab>
+haiku   sonnet   opus   claude-haiku-4-5   claude-sonnet-4-6   claude-opus-4-7   …
+
+$ smart-commit --provider <tab>
+anthropic   openrouter
+
+$ SMART_COMMIT_PROVIDER=openrouter smart-commit -m qwen<tab>
+qwen/qwen3-coder   qwen/qwen3-vl-plus
+```
+
+The `-m` completer is provider-aware: it suggests Claude IDs when the active
+provider is `anthropic`, and a curated mix of OpenRouter IDs (Claude / GPT /
+Gemini / Qwen / Llama / DeepSeek / Grok / Mistral) when it's `openrouter`.
+Anything not in the suggestion list is still a valid value — completion is
+hints, not enforcement.
+
+[argcomplete]: https://kislyuk.github.io/argcomplete/
+
 ### Picking a model on the fly
 
 ```bash
