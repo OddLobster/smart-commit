@@ -1371,6 +1371,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_USER_ERROR
 
+    os.chdir(repo_root)
+
     if args.command == "init":
         return cmd_init(repo_root)
 
