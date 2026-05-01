@@ -1,0 +1,297 @@
+Metadata-Version: 2.4
+Name: smart-commit
+Version: 0.1.0
+Summary: Split staged git changes into atomic, semantically-distinct commits using Claude.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: anthropic>=0.40
+Requires-Dist: argcomplete>=3.0
+
+# smart-commit
+
+Replace `git commit` when you have mixed-concern staged changes. `smart-commit`
+asks an LLM to group your staged files into semantically distinct commits,
+shows the plan, and (with your approval) executes the commits in order.
+
+Supports two providers out of the box:
+- **Anthropic** (default) — uses the Claude API directly with server-side JSON
+  schema enforcement.
+- **OpenRouter** — pick from any model OpenRouter exposes (Claude, GPT, Gemini,
+  Llama, etc.) via the OpenAI-compatible Chat Completions API.
+
+```
+$ git add .
+$ smart-commit
+
+Analyzing 7 staged files...
+
+claude-sonnet-4-6 suggests 3 commits:
+
+  1. feat(api): add license validation endpoint
+     - server/routes/license.py
+     - server/models/license.py
+     - tests/test_license.py
+
+  2. fix(installer): handle spaces in Windows paths
+     - installer/setup.py
+     - installer/path_utils.py
+
+  3. chore: update CI config
+     - .github/workflows/ci.yml
+
+(~4.2k in · 890 out · $0.003)
+
+[A]ccept all / [E]dit / [Q]uit? a
+
+  ✓ (1/3) feat(api): add license validation endpoint
+  ✓ (2/3) fix(installer): handle spaces in Windows paths
+  ✓ (3/3) chore: update CI config
+
+✓ Committed 3/3
+```
+
+## Requirements
+
+- Python 3.11+
+- [`uv`](https://docs.astral.sh/uv/)
+- One of:
+  - `ANTHROPIC_API_KEY` from <https://console.anthropic.com/>, or
+  - `OPENROUTER_API_KEY` from <https://openrouter.ai/keys>
+
+## Install
+
+```bash
+uv tool install /path/to/smart-commit
+smart-commit setup        # one-shot: installs zsh/bash/fish tab-completion
+```
+
+`setup` auto-detects your shell from `$SHELL`, drops a guarded eval block
+into `~/.zshrc` or `~/.bashrc` (or writes a fish completion file), and is
+idempotent — running it twice does nothing the second time. Override with
+`--shell {bash|zsh|fish}` if needed. Removing the completion is just deleting
+the block between the `# >>> smart-commit completion >>>` / `# <<< … <<<`
+markers.
+
+Other ways to invoke:
+
+```bash
+# Run directly via uv inline script metadata (no install)
+uv run /path/to/smart-commit/smart_commit.py
+
+# As a git alias
+git config --global alias.sc '!smart-commit'
+git sc
+```
+
+## Usage
+
+```
+smart-commit [-n | --dry-run] [-y | --auto] [-v | --verbose | --no-verbose]
+             [--provider {anthropic,openrouter}] [-m MODEL]
+```
+
+| Flag | Description |
+|---|---|
+| `-n`, `--dry-run` | Print the plan and exit without committing. |
+| `-y`, `--auto` | Skip the interactive prompt and execute all commits. Equivalent to `SMART_COMMIT_AUTO=1`. |
+| `-v`, `--verbose` | Generate multi-line commit messages with a body paragraph. |
+| `--no-verbose` | Force single-line messages, overriding `verbose_messages = true` in config. |
+| `--provider` | One-shot override of `SMART_COMMIT_PROVIDER`. |
+| `--model` | One-shot model override. Accepts a full ID (`claude-opus-4-7`, `openai/gpt-5`, `qwen/qwen3-vl-plus`) or a short alias (`haiku`, `sonnet`, `opus`) which resolves to the right ID for the active provider. |
+| `-m`, `--context` | Free-form description of what this session covered (mirrors `git commit -m`). Repeatable; multiple flags are joined with a space. |
+
+`--dry-run` and `--auto` are mutually exclusive; if both are passed, `--dry-run`
+wins (no commits are made).
+
+### Telling the model what you actually did (`-m`)
+
+The single biggest accuracy win on ambiguous diffs is telling the model what
+you were doing in plain English — same idea as `git commit -m`, except the
+context isn't a commit message, it's a *session summary* that helps the
+splitter group correctly:
+
+```bash
+smart-commit -m "added license validation endpoint, also fixed windows path bug"
+smart-commit -m "refactored auth module" -m "unrelated CI fix got mixed in"
+```
+
+The string is injected into the prompt as a "Developer context" section
+ahead of the diff. Multiple `-m` flags are joined with a space (mirrors
+`git commit -m`). The model is told to use this as a *grouping anchor*, not
+a blind instruction — if the diff doesn't support what you said, it won't
+hallucinate groups to match.
+
+When context is active, `smart-commit` echoes it under the analyzing line so
+you can see what the model is being told:
+
+```
+Analyzing 7 staged files via openrouter (qwen/qwen3.6-flash)...
+Context: "added license validation, also fixed windows path bug"
+```
+
+For long-lived feature branches with stable intent, set `context` in
+`.smart-commit.toml` and it becomes a persistent baseline that the per-run
+`-m` flag is appended to. Resolution order:
+
+1. `context` from `.smart-commit.toml` (persistent baseline)
+2. `-m` / `--context` CLI flag, OR `SMART_COMMIT_CONTEXT` env (CLI wins)
+3. Final string = `<config>` + `" "` + `<per-run>`
+
+Sweet spot is 1-3 sentences. Longer hurts more than it helps.
+
+### Cost & token visibility
+
+Every run prints a one-liner under the plan with the actual usage:
+
+```
+(~4.2k in · 890 out · $0.003)
+```
+
+For Anthropic, cost is computed from a built-in price table for the Claude
+4.x models. For OpenRouter, the script opts into [usage accounting][or-usage]
+and surfaces the actual USD figure OpenRouter charges — works across every
+model they expose. If pricing isn't known (custom Anthropic model, OpenRouter
+endpoint that didn't return cost), the line drops the dollar figure but still
+shows tokens.
+
+[or-usage]: https://openrouter.ai/docs/use-cases/usage-accounting
+
+### Shell tab-completion
+
+`smart-commit setup` (run once after install) wires up [argcomplete][]-powered
+completion: tab cycles flags, `--provider` choices, subcommands (`init` /
+`setup`), and a curated provider-aware list of models.
+
+If you'd rather wire it up by hand:
+
+```bash
+# zsh — add to ~/.zshrc
+eval "$(smart-commit --print-completion zsh)"
+
+# bash — add to ~/.bashrc
+eval "$(smart-commit --print-completion bash)"
+
+# fish — save once
+smart-commit --print-completion fish > ~/.config/fish/completions/smart-commit.fish
+```
+
+Once active:
+
+```
+$ smart-commit -m <tab>
+haiku   sonnet   opus   claude-haiku-4-5   claude-sonnet-4-6   claude-opus-4-7   …
+
+$ smart-commit --provider <tab>
+anthropic   openrouter
+
+$ SMART_COMMIT_PROVIDER=openrouter smart-commit -m qwen<tab>
+qwen/qwen3-coder   qwen/qwen3-vl-plus
+```
+
+The `-m` completer is provider-aware: it suggests Claude IDs when the active
+provider is `anthropic`, and a curated mix of OpenRouter IDs (Claude / GPT /
+Gemini / Qwen / Llama / DeepSeek / Grok / Mistral) when it's `openrouter`.
+Anything not in the suggestion list is still a valid value — completion is
+hints, not enforcement.
+
+[argcomplete]: https://kislyuk.github.io/argcomplete/
+
+### Picking a model on the fly
+
+```bash
+smart-commit --model haiku                    # fast / cheap, current provider
+smart-commit --model sonnet                   # default-tier (current provider)
+smart-commit --model opus                     # heaviest, current provider
+smart-commit --provider openrouter --model openai/gpt-5
+smart-commit --provider openrouter --model qwen/qwen3-vl-plus
+```
+
+The aliases `haiku` / `sonnet` / `opus` resolve to provider-specific IDs:
+
+| Alias | Anthropic | OpenRouter |
+|---|---|---|
+| `haiku` | `claude-haiku-4-5` | `anthropic/claude-haiku-4.5` |
+| `sonnet` | `claude-sonnet-4-6` | `anthropic/claude-sonnet-4.5` |
+| `opus` | `claude-opus-4-7` | `anthropic/claude-opus-4.7` |
+
+Anything that isn't an alias is passed through verbatim, so any OpenRouter
+model ID just works.
+
+## Environment
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | Required when provider is `anthropic`. |
+| `OPENROUTER_API_KEY` | — | Required when provider is `openrouter`. |
+| `SMART_COMMIT_PROVIDER` | auto-detect | `anthropic` or `openrouter`. Auto-detect uses the API key that is set. |
+| `SMART_COMMIT_MODEL` | provider-specific default | Override the model. |
+| `SMART_COMMIT_BASE_URL` | OpenRouter's URL | Point OpenRouter mode at any OpenAI-compatible endpoint (LiteLLM, Together, …). |
+| `SMART_COMMIT_CONTEXT` | unset | Per-run developer context (same as `-m`). CLI `-m` wins over the env. |
+| `SMART_COMMIT_AUTO` | unset | Truthy values (`1`, `true`, `yes`) imply `--auto`. |
+| `EDITOR` | `vi` | Used for `[E]dit` mode. |
+
+Default models:
+- `anthropic` → `claude-sonnet-4-6`
+- `openrouter` → `anthropic/claude-sonnet-4.5` (override with `SMART_COMMIT_MODEL`, e.g. `openai/gpt-5`, `google/gemini-2.5-pro`, `meta-llama/llama-3.3-70b-instruct`)
+
+## Configuration
+
+Optional `.smart-commit.toml` at the repo root. Run `smart-commit init` once
+to scaffold a fully-commented starter file (everything opt-in, defaults work
+without it). See `.smart-commit.toml.example` for the full schema reference.
+Highlights:
+
+```toml
+# provider = "openrouter"          # uncomment to pin the project to OpenRouter
+# model    = "openai/gpt-5"        # or pin a specific model
+
+conventions = """
+We use conventional commits.
+Scopes: api, installer, ui, infra, docs.
+"""
+verbose_messages = false
+trailers = ["Co-authored-by: Claude <noreply@anthropic.com>"]
+```
+
+Resolution order: CLI flag > env var > `.smart-commit.toml` > built-in default.
+`verbose_messages` is overridden by `--verbose` / `--no-verbose` for a single
+run. `trailers` is repo-level only — there is no CLI override.
+
+## Edit mode
+
+`[E]dit` opens the plan in `$EDITOR` as TOML:
+
+```toml
+[[commit]]
+message = "feat(api): add license validation endpoint"
+body = ""
+files = [
+    "server/routes/license.py",
+    "server/models/license.py",
+]
+reasoning = "These files together implement the license check feature"
+```
+
+Reorder, edit, drop, or split commits. On save, the plan is re-validated
+(every staged file present in exactly one commit, no unknown files). If
+parsing or validation fails the editor reopens once before aborting.
+
+## Scope (v1)
+
+- File-level grouping only. A file is fully in one commit or fully out — no
+  hunk splitting. Files with mixed concerns may produce a less-than-ideal
+  split; fix in `[E]dit` mode.
+- `colocate` and `chore_glob` config keys are accepted but warned and ignored;
+  they are planned for a follow-up.
+- `[S]kip` and `1`-`9` step-through actions from the original spec are
+  deferred. Use `[E]dit` to drop or reorder commits.
+
+## Development
+
+```bash
+uv sync --group dev
+uv run pytest
+```
+
+Tests use a temp git repo and monkeypatch `request_grouping` so no real
+Anthropic API calls are made.

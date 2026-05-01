@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+smart_commit.py
+smart_commit.egg-info/PKG-INFO
+smart_commit.egg-info/SOURCES.txt
+smart_commit.egg-info/dependency_links.txt
+smart_commit.egg-info/entry_points.txt
+smart_commit.egg-info/requires.txt
+smart_commit.egg-info/top_level.txt
+tests/test_smart_commit.py
