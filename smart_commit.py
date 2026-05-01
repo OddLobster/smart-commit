@@ -130,6 +130,12 @@ INIT_TEMPLATE = """\
 # Always lowercase. No period at end of subject line.
 # \"\"\"
 
+# --- Auto-accept --------------------------------------------------------
+
+# When true, skip the confirmation prompt and commit immediately.
+# Override per-run with -y / --auto, or SMART_COMMIT_AUTO=1.
+# auto = false
+
 # --- Commit message style -----------------------------------------------
 
 # When true, generates subject + body per commit. Override per-run with
@@ -533,7 +539,7 @@ def build_config(args: argparse.Namespace, repo_root: Path) -> Config:
             or OPENROUTER_BASE_URL
         )
 
-    cfg.auto = bool(args.auto) or os.environ.get("SMART_COMMIT_AUTO", "").lower() in ("1", "true", "yes")
+    cfg.auto = bool(args.auto) or os.environ.get("SMART_COMMIT_AUTO", "").lower() in ("1", "true", "yes") or bool(raw.get("auto", False))
     cfg.dry_run = bool(args.dry_run)
     if cfg.dry_run:
         cfg.auto = False  # dry-run wins
