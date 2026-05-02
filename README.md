@@ -286,3 +286,18 @@ uv run pytest
 
 Tests use a temp git repo and monkeypatch `request_grouping` so no real
 Anthropic API calls are made.
+
+## Claude Code integration
+
+The `examples/claude-code/commit.md` slash command lets Claude summarize
+what it worked on in the current session and pass that as `-m` context to
+`smart-commit`.
+
+```bash
+cp examples/claude-code/commit.md ~/.claude/commands/commit.md
+```
+
+Then in any Claude Code session, run `/user:commit`. Claude will stage your
+changes, reflect on the session's intent, and run
+`smart-commit -v -y -m "<summary>"` — so the commit splitter gets real
+context about *why* the changes were made, not just what the diff says.
