@@ -1,0 +1,46 @@
+# Copy to .smart-commit.toml at the repo root and edit.
+
+# Provider: "anthropic" (default) or "openrouter".
+# Resolution order: --provider CLI > SMART_COMMIT_PROVIDER env > this key >
+# auto-detect (uses whichever of ANTHROPIC_API_KEY / OPENROUTER_API_KEY is set).
+# provider = "openrouter"
+
+# Model override. Defaults: claude-sonnet-4-6 (anthropic) /
+# anthropic/claude-sonnet-4.5 (openrouter). SMART_COMMIT_MODEL env wins.
+# model = "openai/gpt-5"
+
+# OpenRouter-only: point at a different OpenAI-compatible endpoint
+# (LiteLLM, Together AI, etc.). SMART_COMMIT_BASE_URL env wins.
+# base_url = "https://openrouter.ai/api/v1"
+
+# Persistent developer-context baseline. A one-line description of what the
+# branch is working on. Useful for long-lived feature branches where the
+# high-level goal is stable. Per-run context provided via `-m`/`--context`
+# or SMART_COMMIT_CONTEXT is APPENDED to this (config first, then per-run).
+# Leave commented out unless this branch has a stable, durable intent.
+# context = "v2 migration: new API routes + DB schema changes"
+
+# Free-form text injected into the prompt under "## Project conventions".
+# Use this to teach the model your repo's commit-message house style.
+conventions = """
+We use conventional commits.
+Scopes: api, installer, ui, infra, docs.
+Always lowercase. No period at end of subject line.
+"""
+
+# When true, generates a subject line + body paragraph per commit.
+# Override per-run with --verbose / --no-verbose.
+verbose_messages = false
+
+# Trailers appended to every commit message. Each entry is one full line.
+# Common uses: Co-authored-by for AI attribution, Signed-off-by for DCO.
+# Leave as [] (or omit the key) to disable.
+trailers = []
+# trailers = [
+#     "Co-authored-by: Claude <noreply@anthropic.com>",
+#     "Signed-off-by: Your Name <you@example.com>",
+# ]
+
+# Reserved for v1.1 — accepted but currently ignored (with a warning):
+# colocate = ["*.test.*:*", "migrations/*:models/*"]
+# chore_glob = ["*.lock", ".gitignore"]
