@@ -1407,7 +1407,15 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USER_ERROR
 
     if not config.api_key:
-        if config.provider == PROVIDER_OPENROUTER:
+        if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("OPENROUTER_API_KEY"):
+            print(
+                "error: no API key set. Set one of:\n"
+                "  ANTHROPIC_API_KEY  (get one at https://console.anthropic.com/)\n"
+                "  OPENROUTER_API_KEY (get one at https://openrouter.ai/keys)\n"
+                "Then `export ANTHROPIC_API_KEY=...` or `export OPENROUTER_API_KEY=...`",
+                file=sys.stderr,
+            )
+        elif config.provider == PROVIDER_OPENROUTER:
             print(
                 "error: OPENROUTER_API_KEY is not set. "
                 "Get one at https://openrouter.ai/keys and `export OPENROUTER_API_KEY=...`",
