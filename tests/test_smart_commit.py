@@ -295,6 +295,29 @@ def test_rename_kept_in_one_group(tmp_git_repo, sc, monkeypatch):
     assert staged_files(tmp_git_repo) == []
 
 
+def test_gitignored_but_staged_file_commits(tmp_git_repo, sc, monkeypatch):
+    # A user can force-stage a path matched by .gitignore (e.g. generated
+    # snapshot files explicitly checked in). smart-commit must round-trip
+    # those through reset+re-add without git refusing the re-add.
+    (tmp_git_repo / ".gitignore").write_text("build/\n")
+    (tmp_git_repo / "build").mkdir()
+    (tmp_git_repo / "build" / "snapshot.json").write_text("{}\n")
+    subprocess.run(
+        ["git", "add", "-f", "build/snapshot.json"],
+        cwd=tmp_git_repo, check=True,
+    )
+
+    groups = [
+        sc.CommitGroup(message="test: refresh snapshot", files=["build/snapshot.json"])
+    ]
+    _patch_grouping(monkeypatch, sc, groups)
+
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    assert "test: refresh snapshot" in commit_log_subjects(tmp_git_repo)
+    assert staged_files(tmp_git_repo) == []
+
+
 def test_verbose_writes_body_into_commit(tmp_git_repo, sc, monkeypatch):
     stage_files(tmp_git_repo, {"a.py": "1\n"})
     groups = [
