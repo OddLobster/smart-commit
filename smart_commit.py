@@ -435,7 +435,7 @@ def git_reset_index() -> None:
 def git_add_all(paths: list[str]) -> None:
     if not paths:
         return
-    run_git(["add", "-A", "--", *paths])
+    run_git(["add", "-A", "-f", "--", *paths])
 
 
 def git_commit_with_message(message: str) -> None:
