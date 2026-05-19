@@ -49,7 +49,7 @@ def tmp_git_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     _git(tmp_path, "add", "README.md")
     _git(tmp_path, "commit", "-q", "-m", "initial commit")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "test-key-not-used")
     monkeypatch.delenv("SMART_COMMIT_AUTO", raising=False)
     monkeypatch.delenv("SMART_COMMIT_MODEL", raising=False)
     return tmp_path

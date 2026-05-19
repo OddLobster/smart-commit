@@ -248,7 +248,7 @@ def test_no_staged_changes_exits_cleanly(tmp_git_repo, sc, monkeypatch):
 
 def test_missing_api_key(tmp_git_repo, sc, monkeypatch):
     stage_files(tmp_git_repo, {"a.py": "1\n"})
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("SMART_COMMIT_API_KEY", raising=False)
     rc = sc.main([])
     assert rc == sc.EXIT_USER_ERROR
 
@@ -375,7 +375,6 @@ def _ns(**kwargs):
         auto=False,
         dry_run=False,
         verbose=None,
-        provider=None,
         model=None,
         context=None,
     )
@@ -383,66 +382,37 @@ def _ns(**kwargs):
     return argparse.Namespace(**defaults)
 
 
-def test_provider_defaults_to_anthropic(sc, tmp_path, monkeypatch):
-    monkeypatch.delenv("SMART_COMMIT_PROVIDER", raising=False)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+def test_build_config_defaults(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "test")
+    monkeypatch.delenv("SMART_COMMIT_API_BASE", raising=False)
+    monkeypatch.delenv("SMART_COMMIT_MODEL", raising=False)
     cfg = sc.build_config(_ns(), tmp_path)
-    assert cfg.provider == sc.PROVIDER_ANTHROPIC
-    assert cfg.model == sc.DEFAULT_MODEL_BY_PROVIDER[sc.PROVIDER_ANTHROPIC]
+    assert cfg.model == sc.DEFAULT_MODEL
+    assert cfg.base_url == sc.DEFAULT_API_BASE
     assert cfg.api_key == "test"
 
 
-def test_provider_autodetect_openrouter(sc, tmp_path, monkeypatch):
-    monkeypatch.delenv("SMART_COMMIT_PROVIDER", raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test")
+def test_build_config_api_base_env_override(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "test")
+    monkeypatch.setenv("SMART_COMMIT_API_BASE", "https://litellm.example.com/v1")
     cfg = sc.build_config(_ns(), tmp_path)
-    assert cfg.provider == sc.PROVIDER_OPENROUTER
-    assert cfg.model == sc.DEFAULT_MODEL_BY_PROVIDER[sc.PROVIDER_OPENROUTER]
-    assert cfg.base_url == sc.OPENROUTER_BASE_URL
-    assert cfg.api_key == "or-test"
-
-
-def test_provider_env_var_wins(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-    monkeypatch.setenv("SMART_COMMIT_PROVIDER", "openrouter")
-    cfg = sc.build_config(_ns(), tmp_path)
-    assert cfg.provider == sc.PROVIDER_OPENROUTER
-
-
-def test_provider_cli_flag_wins(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-    monkeypatch.setenv("SMART_COMMIT_PROVIDER", "openrouter")
-    cfg = sc.build_config(_ns(provider="anthropic"), tmp_path)
-    assert cfg.provider == sc.PROVIDER_ANTHROPIC
-
-
-def test_provider_invalid_value_errors(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("SMART_COMMIT_PROVIDER", "made-up")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
-    with pytest.raises(ValueError):
-        sc.build_config(_ns(), tmp_path)
+    assert cfg.base_url == "https://litellm.example.com/v1"
 
 
 def test_smart_commit_model_env_overrides_default(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
-    monkeypatch.setenv("SMART_COMMIT_MODEL", "claude-haiku-4-5")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_MODEL", "anthropic/claude-haiku-4.5")
     cfg = sc.build_config(_ns(), tmp_path)
-    assert cfg.model == "claude-haiku-4-5"
+    assert cfg.model == "anthropic/claude-haiku-4.5"
 
 
-def test_openrouter_missing_key_message(tmp_git_repo, sc, monkeypatch, capsys):
+def test_missing_api_key_message(tmp_git_repo, sc, monkeypatch, capsys):
     stage_files(tmp_git_repo, {"a.py": "1\n"})
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setenv("SMART_COMMIT_PROVIDER", "openrouter")
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("SMART_COMMIT_API_KEY", raising=False)
     rc = sc.main([])
     assert rc == sc.EXIT_USER_ERROR
     err = capsys.readouterr().err
-    assert "OPENROUTER_API_KEY" in err
+    assert "SMART_COMMIT_API_KEY" in err
 
 
 def test_openrouter_request_happy_path(sc, monkeypatch):
@@ -494,12 +464,11 @@ def test_openrouter_request_happy_path(sc, monkeypatch):
     monkeypatch.setattr(sc.httpx, "Client", FakeClient)
 
     cfg = sc.Config(
-        provider=sc.PROVIDER_OPENROUTER,
         model="anthropic/claude-sonnet-4.6",
         api_key="or-test",
-        base_url=sc.OPENROUTER_BASE_URL,
+        base_url=sc.DEFAULT_API_BASE,
     )
-    items, usage = sc._request_openrouter(cfg, "system text", "user text")
+    items, usage = sc._request_completion(cfg, "system text", "user text")
     assert items == [{"message": "feat: x", "files": ["a.py"], "body": "", "reasoning": "r"}]
     assert isinstance(usage, sc.Usage)
     assert captured["url"].endswith("/chat/completions")
@@ -545,12 +514,11 @@ def test_openrouter_strips_markdown_fences(sc, monkeypatch):
 
     monkeypatch.setattr(sc.httpx, "Client", FakeClient)
     cfg = sc.Config(
-        provider=sc.PROVIDER_OPENROUTER,
         model="some/model",
         api_key="or-test",
-        base_url=sc.OPENROUTER_BASE_URL,
+        base_url=sc.DEFAULT_API_BASE,
     )
-    items, _usage = sc._request_openrouter(cfg, "system", "user")
+    items, _usage = sc._request_completion(cfg, "system", "user")
     assert items[0]["message"] == "feat: x"
 
 
@@ -595,12 +563,11 @@ def test_openrouter_retries_on_bad_json(sc, monkeypatch):
 
     monkeypatch.setattr(sc.httpx, "Client", FakeClient)
     cfg = sc.Config(
-        provider=sc.PROVIDER_OPENROUTER,
         model="some/model",
         api_key="or-test",
-        base_url=sc.OPENROUTER_BASE_URL,
+        base_url=sc.DEFAULT_API_BASE,
     )
-    items, _usage = sc._request_openrouter(cfg, "system", "user")
+    items, _usage = sc._request_completion(cfg, "system", "user")
     assert calls["n"] == 2
     assert items[0]["files"] == ["b.py"]
 
@@ -644,12 +611,11 @@ def test_openrouter_extracts_cost_from_response(sc, monkeypatch):
 
     monkeypatch.setattr(sc.httpx, "Client", FakeClient)
     cfg = sc.Config(
-        provider=sc.PROVIDER_OPENROUTER,
         model="some/model",
         api_key="or-test",
-        base_url=sc.OPENROUTER_BASE_URL,
+        base_url=sc.DEFAULT_API_BASE,
     )
-    _items, usage = sc._request_openrouter(cfg, "system", "user")
+    _items, usage = sc._request_completion(cfg, "system", "user")
     assert usage.input_tokens == 4321
     assert usage.output_tokens == 890
     assert usage.cost_usd == pytest.approx(0.00342)
@@ -697,12 +663,11 @@ def test_openrouter_byok_uses_upstream_inference_cost(sc, monkeypatch):
 
     monkeypatch.setattr(sc.httpx, "Client", FakeClient)
     cfg = sc.Config(
-        provider=sc.PROVIDER_OPENROUTER,
         model="anthropic/claude-sonnet-4.6",
         api_key="or-test",
-        base_url=sc.OPENROUTER_BASE_URL,
+        base_url=sc.DEFAULT_API_BASE,
     )
-    _items, usage = sc._request_openrouter(cfg, "system", "user")
+    _items, usage = sc._request_completion(cfg, "system", "user")
     assert usage.cost_usd == pytest.approx(0.0125)
     assert usage.estimated is False  # upstream is reported, not estimated
 
@@ -745,14 +710,13 @@ def test_openrouter_byok_falls_back_to_local_estimate_for_anthropic(sc, monkeypa
 
     monkeypatch.setattr(sc.httpx, "Client", FakeClient)
     cfg = sc.Config(
-        provider=sc.PROVIDER_OPENROUTER,
         # OpenRouter uses dot-separated versions; our local table uses dashes.
         # The fallback should normalize the ID.
         model="anthropic/claude-sonnet-4.6",
         api_key="or-test",
-        base_url=sc.OPENROUTER_BASE_URL,
+        base_url=sc.DEFAULT_API_BASE,
     )
-    _items, usage = sc._request_openrouter(cfg, "system", "user")
+    _items, usage = sc._request_completion(cfg, "system", "user")
     # 4000 in @ $3/M + 1000 out @ $15/M = 0.012 + 0.015 = 0.027
     assert usage.cost_usd == pytest.approx(0.027)
     assert usage.estimated is True
@@ -795,12 +759,11 @@ def test_openrouter_zero_cost_non_anthropic_yields_none(sc, monkeypatch):
 
     monkeypatch.setattr(sc.httpx, "Client", FakeClient)
     cfg = sc.Config(
-        provider=sc.PROVIDER_OPENROUTER,
         model="qwen/qwen3-coder",
         api_key="or-test",
-        base_url=sc.OPENROUTER_BASE_URL,
+        base_url=sc.DEFAULT_API_BASE,
     )
-    _items, usage = sc._request_openrouter(cfg, "system", "user")
+    _items, usage = sc._request_completion(cfg, "system", "user")
     assert usage.cost_usd is None
     assert usage.estimated is False
 
@@ -852,12 +815,11 @@ def test_openrouter_missing_cost_yields_none(sc, monkeypatch):
 
     monkeypatch.setattr(sc.httpx, "Client", FakeClient)
     cfg = sc.Config(
-        provider=sc.PROVIDER_OPENROUTER,
         model="x",
         api_key="k",
-        base_url=sc.OPENROUTER_BASE_URL,
+        base_url=sc.DEFAULT_API_BASE,
     )
-    _items, usage = sc._request_openrouter(cfg, "s", "u")
+    _items, usage = sc._request_completion(cfg, "s", "u")
     assert usage.input_tokens == 100
     assert usage.output_tokens == 50
     assert usage.cost_usd is None
@@ -886,13 +848,12 @@ def test_openrouter_http_error_raises_apicallerror(sc, monkeypatch):
 
     monkeypatch.setattr(sc.httpx, "Client", FakeClient)
     cfg = sc.Config(
-        provider=sc.PROVIDER_OPENROUTER,
         model="some/model",
         api_key="bad",
-        base_url=sc.OPENROUTER_BASE_URL,
+        base_url=sc.DEFAULT_API_BASE,
     )
     with pytest.raises(sc.APICallError):
-        sc._request_openrouter(cfg, "system", "user")
+        sc._request_completion(cfg, "system", "user")
 
 
 # ----------------------------------------------------------------------
@@ -900,48 +861,35 @@ def test_openrouter_http_error_raises_apicallerror(sc, monkeypatch):
 # ----------------------------------------------------------------------
 
 
-def test_resolve_model_aliases_anthropic(sc):
-    assert sc.resolve_model("haiku", sc.PROVIDER_ANTHROPIC) == "claude-haiku-4-5"
-    assert sc.resolve_model("sonnet", sc.PROVIDER_ANTHROPIC) == "claude-sonnet-4-6"
-    assert sc.resolve_model("opus", sc.PROVIDER_ANTHROPIC) == "claude-opus-4-7"
-
-
-def test_resolve_model_aliases_openrouter(sc):
-    assert sc.resolve_model("haiku", sc.PROVIDER_OPENROUTER) == "anthropic/claude-haiku-4.5"
-    assert sc.resolve_model("sonnet", sc.PROVIDER_OPENROUTER) == "anthropic/claude-sonnet-4.6"
-    assert sc.resolve_model("opus", sc.PROVIDER_OPENROUTER) == "anthropic/claude-opus-4.7"
+def test_resolve_model_aliases(sc):
+    assert sc.resolve_model("haiku") == "anthropic/claude-haiku-4.5"
+    assert sc.resolve_model("sonnet") == "anthropic/claude-sonnet-4.6"
+    assert sc.resolve_model("opus") == "anthropic/claude-opus-4.7"
 
 
 def test_resolve_model_passes_unknown_through(sc):
-    assert sc.resolve_model("openai/gpt-5", sc.PROVIDER_OPENROUTER) == "openai/gpt-5"
-    assert sc.resolve_model("claude-haiku-4-5", sc.PROVIDER_ANTHROPIC) == "claude-haiku-4-5"
+    assert sc.resolve_model("openai/gpt-5") == "openai/gpt-5"
+    assert sc.resolve_model("claude-haiku-4-5") == "claude-haiku-4-5"
 
 
 def test_resolve_model_alias_case_insensitive(sc):
-    assert sc.resolve_model("HAIKU", sc.PROVIDER_ANTHROPIC) == "claude-haiku-4-5"
-    assert sc.resolve_model(" Sonnet ", sc.PROVIDER_ANTHROPIC) == "claude-sonnet-4-6"
+    assert sc.resolve_model("HAIKU") == "anthropic/claude-haiku-4.5"
+    assert sc.resolve_model(" Sonnet ") == "anthropic/claude-sonnet-4.6"
 
 
 def test_model_cli_flag_wins_over_env(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
-    monkeypatch.setenv("SMART_COMMIT_MODEL", "claude-opus-4-7")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_MODEL", "anthropic/claude-opus-4.7")
     cfg = sc.build_config(_ns(model="haiku"), tmp_path)
-    assert cfg.model == "claude-haiku-4-5"
+    assert cfg.model == "anthropic/claude-haiku-4.5"
 
 
 def test_model_env_wins_over_config(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
     (tmp_path / sc.CONFIG_FILENAME).write_text('model = "sonnet"\n')
     monkeypatch.setenv("SMART_COMMIT_MODEL", "haiku")
     cfg = sc.build_config(_ns(), tmp_path)
-    assert cfg.model == "claude-haiku-4-5"
-
-
-def test_model_alias_resolves_against_active_provider(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
-    monkeypatch.setenv("SMART_COMMIT_PROVIDER", "openrouter")
-    cfg = sc.build_config(_ns(model="opus"), tmp_path)
-    assert cfg.model == "anthropic/claude-opus-4.7"
+    assert cfg.model == "anthropic/claude-haiku-4.5"
 
 
 # ----------------------------------------------------------------------
@@ -992,39 +940,16 @@ def test_model_display_name_strips_namespace(sc):
     assert sc.model_display_name("") == "model"
 
 
-def test_model_completer_anthropic(sc, monkeypatch):
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("SMART_COMMIT_PROVIDER", raising=False)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
-    ns = argparse.Namespace(provider=None)
-    suggestions = sc._model_completer("", ns)
+def test_model_completer_returns_curated_list(sc):
+    suggestions = sc._model_completer("", argparse.Namespace())
     assert "haiku" in suggestions
     assert "sonnet" in suggestions
     assert "opus" in suggestions
-    assert "claude-sonnet-4-6" in suggestions
-    # Aliases come first so tab cycles them before full IDs
-    assert suggestions.index("haiku") < suggestions.index("claude-sonnet-4-6")
-
-
-def test_model_completer_openrouter_autodetect(sc, monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("SMART_COMMIT_PROVIDER", raising=False)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
-    ns = argparse.Namespace(provider=None)
-    suggestions = sc._model_completer("", ns)
-    assert "openai/gpt-5" in suggestions
     assert "anthropic/claude-sonnet-4.6" in suggestions
-    assert "qwen/qwen3-coder" in suggestions
-
-
-def test_model_completer_explicit_provider_wins(sc, monkeypatch):
-    """When --provider is on the command line, it overrides env-based auto-detect."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    ns = argparse.Namespace(provider="openrouter")
-    suggestions = sc._model_completer("", ns)
     assert "openai/gpt-5" in suggestions
-    assert "claude-sonnet-4-6" not in suggestions
+    assert "qwen/qwen3-coder" in suggestions
+    # Aliases come first so tab cycles them before full IDs.
+    assert suggestions.index("haiku") < suggestions.index("anthropic/claude-sonnet-4.6")
 
 
 # ----------------------------------------------------------------------
@@ -1172,7 +1097,7 @@ def test_init_template_is_valid_toml(tmp_git_repo, sc):
 
 def test_init_template_passes_through_load_config(tmp_git_repo, sc, monkeypatch):
     """Generated file must round-trip through build_config without errors."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
     sc.main(["init"])
     cfg = sc.build_config(_ns(), tmp_git_repo)
     # All-commented template should produce default config.
@@ -1409,14 +1334,14 @@ def test_context_omitted_when_whitespace_only(sc):
 
 
 def test_context_priority_cli_wins_over_env(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
     monkeypatch.setenv("SMART_COMMIT_CONTEXT", "from env")
     cfg = sc.build_config(_ns(context=["from cli"]), tmp_path)
     assert cfg.context == "from cli"
 
 
 def test_context_env_used_when_no_cli(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
     monkeypatch.setenv("SMART_COMMIT_CONTEXT", "from env")
     cfg = sc.build_config(_ns(), tmp_path)
     assert cfg.context == "from env"
@@ -1424,35 +1349,35 @@ def test_context_env_used_when_no_cli(sc, tmp_path, monkeypatch):
 
 def test_context_config_baseline_concatenated_with_per_run(sc, tmp_path, monkeypatch):
     """Config provides a persistent baseline that gets joined with CLI/env per-run."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
     (tmp_path / sc.CONFIG_FILENAME).write_text('context = "v2 migration branch"\n')
     cfg = sc.build_config(_ns(context=["new license endpoint"]), tmp_path)
     assert cfg.context == "v2 migration branch new license endpoint"
 
 
 def test_context_config_only(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
     (tmp_path / sc.CONFIG_FILENAME).write_text('context = "long-running auth rewrite"\n')
     cfg = sc.build_config(_ns(), tmp_path)
     assert cfg.context == "long-running auth rewrite"
 
 
 def test_context_multiple_cli_flags_concatenate(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
     cfg = sc.build_config(_ns(context=["new license endpoint", "windows path fix"]), tmp_path)
     assert cfg.context == "new license endpoint windows path fix"
 
 
 def test_context_empty_cli_flag_treated_as_no_context(sc, tmp_path, monkeypatch):
     """`-m ""` is filtered out — falls back to env / config."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
     monkeypatch.setenv("SMART_COMMIT_CONTEXT", "fallback")
     cfg = sc.build_config(_ns(context=["", "  "]), tmp_path)
     assert cfg.context == "fallback"
 
 
 def test_context_default_is_empty(sc, tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
     monkeypatch.delenv("SMART_COMMIT_CONTEXT", raising=False)
     cfg = sc.build_config(_ns(), tmp_path)
     assert cfg.context == ""
