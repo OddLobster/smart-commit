@@ -1,17 +1,14 @@
 # Copy to .smart-commit.toml at the repo root and edit.
 
-# Provider: "anthropic" (default) or "openrouter".
-# Resolution order: --provider CLI > SMART_COMMIT_PROVIDER env > this key >
-# auto-detect (uses whichever of ANTHROPIC_API_KEY / OPENROUTER_API_KEY is set).
-# provider = "openrouter"
-
-# Model override. Defaults: claude-sonnet-4-6 (anthropic) /
-# anthropic/claude-sonnet-4.5 (openrouter). SMART_COMMIT_MODEL env wins.
+# Model override. Default: anthropic/claude-sonnet-4.6 (via OpenRouter).
+# Short aliases ('haiku', 'sonnet', 'opus') resolve to anthropic/* IDs.
+# SMART_COMMIT_MODEL env wins.
 # model = "openai/gpt-5"
 
-# OpenRouter-only: point at a different OpenAI-compatible endpoint
-# (LiteLLM, Together AI, etc.). SMART_COMMIT_BASE_URL env wins.
-# base_url = "https://openrouter.ai/api/v1"
+# Any OpenAI-compatible /chat/completions endpoint. Default is OpenRouter;
+# point at LiteLLM, Together AI, a local proxy, etc. SMART_COMMIT_API_BASE
+# env wins.
+# api_base = "https://openrouter.ai/api/v1"
 
 # Persistent developer-context baseline. A one-line description of what the
 # branch is working on. Useful for long-lived feature branches where the

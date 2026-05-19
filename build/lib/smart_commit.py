@@ -32,7 +32,7 @@ VALID_PROVIDERS = (PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER)
 
 DEFAULT_MODEL_BY_PROVIDER = {
     PROVIDER_ANTHROPIC: "claude-sonnet-4-6",
-    PROVIDER_OPENROUTER: "anthropic/claude-sonnet-4.5",
+    PROVIDER_OPENROUTER: "anthropic/claude-sonnet-4.6",
 }
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -47,7 +47,7 @@ MODEL_ALIASES: dict[str, dict[str, str]] = {
     },
     PROVIDER_OPENROUTER: {
         "haiku": "anthropic/claude-haiku-4.5",
-        "sonnet": "anthropic/claude-sonnet-4.5",
+        "sonnet": "anthropic/claude-sonnet-4.6",
         "opus": "anthropic/claude-opus-4.7",
     },
 }
@@ -70,18 +70,25 @@ MODEL_COMPLETION_HINTS: dict[str, list[str]] = {
         "sonnet",
         "opus",
         "anthropic/claude-haiku-4.5",
-        "anthropic/claude-sonnet-4.5",
+        "anthropic/claude-sonnet-4.6",
+        "anthropic/claude-opus-4.6",
         "anthropic/claude-opus-4.7",
         "openai/gpt-5",
+        "openai/gpt-5.5",
+        "openai/o4-mini",
         "openai/gpt-4.1",
         "google/gemini-2.5-pro",
         "google/gemini-2.5-flash",
-        "meta-llama/llama-3.3-70b-instruct",
-        "qwen/qwen3-coder",
-        "qwen/qwen3-vl-plus",
+        "google/gemini-3.1-pro-preview",
         "deepseek/deepseek-r1",
+        "deepseek/deepseek-v4-pro",
+        "meta-llama/llama-4-maverick",
+        "qwen/qwen3-coder",
+        "qwen/qwen3-max",
         "x-ai/grok-4",
         "mistralai/mistral-large",
+        "mistralai/devstral-medium",
+        "moonshotai/kimi-k2.6",
     ],
 }
 
@@ -122,6 +129,12 @@ INIT_TEMPLATE = """\
 # Scopes: api, ui, infra, docs.
 # Always lowercase. No period at end of subject line.
 # \"\"\"
+
+# --- Auto-accept --------------------------------------------------------
+
+# When true, skip the confirmation prompt and commit immediately.
+# Override per-run with -y / --auto, or SMART_COMMIT_AUTO=1.
+# auto = false
 
 # --- Commit message style -----------------------------------------------
 
@@ -422,7 +435,7 @@ def git_reset_index() -> None:
 def git_add_all(paths: list[str]) -> None:
     if not paths:
         return
-    run_git(["add", "-A", "--", *paths])
+    run_git(["add", "-A", "-f", "--", *paths])
 
 
 def git_commit_with_message(message: str) -> None:
@@ -526,7 +539,7 @@ def build_config(args: argparse.Namespace, repo_root: Path) -> Config:
             or OPENROUTER_BASE_URL
         )
 
-    cfg.auto = bool(args.auto) or os.environ.get("SMART_COMMIT_AUTO", "").lower() in ("1", "true", "yes")
+    cfg.auto = bool(args.auto) or os.environ.get("SMART_COMMIT_AUTO", "").lower() in ("1", "true", "yes") or bool(raw.get("auto", False))
     cfg.dry_run = bool(args.dry_run)
     if cfg.dry_run:
         cfg.auto = False  # dry-run wins
@@ -1182,6 +1195,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     model_arg.completer = _model_completer  # type: ignore[attr-defined]
 
+    set_model_arg = parser.add_argument(
+        "--set-model",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Permanently set the model in .smart-commit.toml and exit. "
+            "Accepts the same values as --model."
+        ),
+    )
+    set_model_arg.completer = _model_completer  # type: ignore[attr-defined]
+
     parser.add_argument(
         "-m",
         "--context",
@@ -1290,6 +1314,34 @@ def cmd_setup(shell_override: str | None) -> int:
     return EXIT_USER_ERROR
 
 
+def cmd_set_model(repo_root: Path, raw_model: str) -> int:
+    """Persist *raw_model* into `.smart-commit.toml`."""
+    config_path = repo_root / CONFIG_FILENAME
+
+    # Resolve the alias so the stored value is a concrete model ID.
+    raw = load_config(repo_root)
+    provider = str(raw.get("provider", "")).strip().lower() or PROVIDER_ANTHROPIC
+    if os.environ.get("SMART_COMMIT_PROVIDER"):
+        provider = os.environ["SMART_COMMIT_PROVIDER"].strip().lower()
+    model = resolve_model(raw_model, provider)
+
+    if not config_path.exists():
+        config_path.write_text(f'model = "{model}"\n')
+        print(f"Created {config_path} with model = \"{model}\"")
+        return EXIT_OK
+
+    text = config_path.read_text()
+    # Replace existing model line (commented or not) or append.
+    pattern = re.compile(r"^#?\s*model\s*=\s*.*$", re.MULTILINE)
+    if pattern.search(text):
+        text = pattern.sub(f'model = "{model}"', text, count=1)
+    else:
+        text = text.rstrip("\n") + f'\nmodel = "{model}"\n'
+    config_path.write_text(text)
+    print(f"Saved model = \"{model}\" in {config_path}")
+    return EXIT_OK
+
+
 def cmd_init(repo_root: Path) -> int:
     """Scaffold a `.smart-commit.toml` at the repo root."""
     target = repo_root / CONFIG_FILENAME
@@ -1325,8 +1377,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_USER_ERROR
 
+    os.chdir(repo_root)
+
     if args.command == "init":
         return cmd_init(repo_root)
+
+    if args.set_model:
+        return cmd_set_model(repo_root, args.set_model)
 
     in_progress = git_in_progress_state()
     if in_progress:
@@ -1350,7 +1407,15 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USER_ERROR
 
     if not config.api_key:
-        if config.provider == PROVIDER_OPENROUTER:
+        if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("OPENROUTER_API_KEY"):
+            print(
+                "error: no API key set. Set one of:\n"
+                "  ANTHROPIC_API_KEY  (get one at https://console.anthropic.com/)\n"
+                "  OPENROUTER_API_KEY (get one at https://openrouter.ai/keys)\n"
+                "Then `export ANTHROPIC_API_KEY=...` or `export OPENROUTER_API_KEY=...`",
+                file=sys.stderr,
+            )
+        elif config.provider == PROVIDER_OPENROUTER:
             print(
                 "error: OPENROUTER_API_KEY is not set. "
                 "Get one at https://openrouter.ai/keys and `export OPENROUTER_API_KEY=...`",
