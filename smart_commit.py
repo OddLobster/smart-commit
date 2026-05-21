@@ -26,7 +26,7 @@ import argcomplete
 import httpx
 
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_MODEL = "qwen/qwen3.6-flash"
 
 # Short aliases for the --model flag. Resolve to OpenRouter-style IDs since
 # the default endpoint is OpenRouter; anything not in this map (a full

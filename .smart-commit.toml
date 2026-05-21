@@ -5,8 +5,7 @@
 # auto-detect (uses whichever of ANTHROPIC_API_KEY / OPENROUTER_API_KEY is set).
 # provider = "openrouter"
 
-# Model override. Defaults: claude-sonnet-4-6 (anthropic) /
-# anthropic/claude-sonnet-4.5 (openrouter). SMART_COMMIT_MODEL env wins.
+# Model override. Default: qwen/qwen3.6-flash. SMART_COMMIT_MODEL env wins.
 model = "qwen/qwen3.6-flash"
 
 # OpenRouter-only: point at a different OpenAI-compatible endpoint
