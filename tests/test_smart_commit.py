@@ -468,7 +468,7 @@ def test_openrouter_request_happy_path(sc, monkeypatch):
         api_key="or-test",
         base_url=sc.DEFAULT_API_BASE,
     )
-    items, usage = sc._request_completion(cfg, "system text", "user text")
+    items, usage = sc._request_completion(cfg, "system text", "user text", ["a.py"])
     assert items == [{"message": "feat: x", "files": ["a.py"], "body": "", "reasoning": "r"}]
     assert isinstance(usage, sc.Usage)
     assert captured["url"].endswith("/chat/completions")
@@ -518,7 +518,7 @@ def test_openrouter_strips_markdown_fences(sc, monkeypatch):
         api_key="or-test",
         base_url=sc.DEFAULT_API_BASE,
     )
-    items, _usage = sc._request_completion(cfg, "system", "user")
+    items, _usage = sc._request_completion(cfg, "system", "user", ["a.py"])
     assert items[0]["message"] == "feat: x"
 
 
@@ -567,9 +567,139 @@ def test_openrouter_retries_on_bad_json(sc, monkeypatch):
         api_key="or-test",
         base_url=sc.DEFAULT_API_BASE,
     )
-    items, _usage = sc._request_completion(cfg, "system", "user")
+    items, _usage = sc._request_completion(cfg, "system", "user", ["b.py"])
     assert calls["n"] == 2
     assert items[0]["files"] == ["b.py"]
+
+
+# ----------------------------------------------------------------------
+# Numeric file IDs (anti-hallucination)
+# ----------------------------------------------------------------------
+
+
+def test_resolve_file_ref_numeric_ids(sc):
+    files = ["src/a.py", "src/b.py", "docs/c.md"]
+    assert sc._resolve_file_ref(1, files) == "src/a.py"
+    assert sc._resolve_file_ref(3, files) == "docs/c.md"
+    assert sc._resolve_file_ref("2", files) == "src/b.py"  # stringified ID
+
+
+def test_resolve_file_ref_exact_path_fallback(sc):
+    files = ["src/a.py", "src/b.py"]
+    assert sc._resolve_file_ref("src/b.py", files) == "src/b.py"
+
+
+def test_resolve_file_ref_rejects_bad_refs(sc):
+    files = ["src/a.py"]
+    with pytest.raises(ValueError):
+        sc._resolve_file_ref(0, files)
+    with pytest.raises(ValueError):
+        sc._resolve_file_ref(2, files)
+    with pytest.raises(ValueError):
+        sc._resolve_file_ref(True, files)
+    with pytest.raises(ValueError):
+        sc._resolve_file_ref("src/hallucinated.py", files)
+    with pytest.raises(ValueError):
+        sc._resolve_file_ref(None, files)
+
+
+def _make_fake_client(sc, monkeypatch, responses: list[str], calls: dict):
+    """Patch httpx.Client so successive posts return the given message contents."""
+
+    class FakeResponse:
+        def __init__(self, content):
+            self._content = content
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": self._content}}]}
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            calls["payloads"].append(json)
+            content = responses[min(len(calls["payloads"]) - 1, len(responses) - 1)]
+            return FakeResponse(content)
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+
+
+def test_completion_resolves_numeric_ids_to_paths(sc, monkeypatch):
+    calls = {"payloads": []}
+    _make_fake_client(sc, monkeypatch, [
+        '{"commits":[{"message":"feat: x","files":[2,1],"body":"","reasoning":"r"}]}',
+    ], calls)
+    cfg = sc.Config(model="m", api_key="k", base_url=sc.DEFAULT_API_BASE)
+    items, _usage = sc._request_completion(cfg, "system", "user", ["src/a.py", "src/b.py"])
+    assert items[0]["files"] == ["src/b.py", "src/a.py"]
+
+
+def test_completion_retries_on_hallucinated_path(sc, monkeypatch):
+    """A path not in the staged list is a parse failure: one corrective retry."""
+    calls = {"payloads": []}
+    _make_fake_client(sc, monkeypatch, [
+        '{"commits":[{"message":"feat: x","files":["src/shim/a.py"],"body":"","reasoning":"r"}]}',
+        '{"commits":[{"message":"feat: x","files":[1],"body":"","reasoning":"r"}]}',
+    ], calls)
+    cfg = sc.Config(model="m", api_key="k", base_url=sc.DEFAULT_API_BASE)
+    items, _usage = sc._request_completion(cfg, "system", "user", ["src/a.py"])
+    assert len(calls["payloads"]) == 2
+    assert items[0]["files"] == ["src/a.py"]
+    # The corrective turn names the bad reference and asks for numeric IDs.
+    retry_msg = calls["payloads"][1]["messages"][-1]["content"]
+    assert "src/shim/a.py" in retry_msg
+    assert "numeric ID" in retry_msg
+
+
+def test_completion_retries_on_out_of_range_id(sc, monkeypatch):
+    calls = {"payloads": []}
+    _make_fake_client(sc, monkeypatch, [
+        '{"commits":[{"message":"x","files":[5],"body":"","reasoning":"r"}]}',
+        '{"commits":[{"message":"x","files":[1,2],"body":"","reasoning":"r"}]}',
+    ], calls)
+    cfg = sc.Config(model="m", api_key="k", base_url=sc.DEFAULT_API_BASE)
+    items, _usage = sc._request_completion(cfg, "system", "user", ["a.py", "b.py"])
+    assert len(calls["payloads"]) == 2
+    assert items[0]["files"] == ["a.py", "b.py"]
+
+
+def test_completion_fails_after_persistent_hallucination(sc, monkeypatch):
+    calls = {"payloads": []}
+    _make_fake_client(sc, monkeypatch, [
+        '{"commits":[{"message":"x","files":["nope.py"],"body":"","reasoning":"r"}]}',
+    ], calls)
+    cfg = sc.Config(model="m", api_key="k", base_url=sc.DEFAULT_API_BASE)
+    with pytest.raises(sc.APICallError):
+        sc._request_completion(cfg, "system", "user", ["a.py"])
+    assert len(calls["payloads"]) == 2
+
+
+def test_schema_files_are_integers(sc):
+    items = sc.RESPONSE_SCHEMA["properties"]["commits"]["items"]
+    assert items["properties"]["files"]["items"] == {"type": "integer"}
+
+
+def test_user_message_numbers_staged_files(sc):
+    msg = sc.build_user_message(
+        diff="d",
+        files=["src/a.py", "src/b.py"],
+        recent_log="",
+        conventions="",
+        context="",
+    )
+    assert "1. src/a.py" in msg
+    assert "2. src/b.py" in msg
+    assert "numeric ID" in msg
 
 
 def test_openrouter_extracts_cost_from_response(sc, monkeypatch):
@@ -615,7 +745,7 @@ def test_openrouter_extracts_cost_from_response(sc, monkeypatch):
         api_key="or-test",
         base_url=sc.DEFAULT_API_BASE,
     )
-    _items, usage = sc._request_completion(cfg, "system", "user")
+    _items, usage = sc._request_completion(cfg, "system", "user", ["a"])
     assert usage.input_tokens == 4321
     assert usage.output_tokens == 890
     assert usage.cost_usd == pytest.approx(0.00342)
@@ -667,7 +797,7 @@ def test_openrouter_byok_uses_upstream_inference_cost(sc, monkeypatch):
         api_key="or-test",
         base_url=sc.DEFAULT_API_BASE,
     )
-    _items, usage = sc._request_completion(cfg, "system", "user")
+    _items, usage = sc._request_completion(cfg, "system", "user", ["a"])
     assert usage.cost_usd == pytest.approx(0.0125)
     assert usage.estimated is False  # upstream is reported, not estimated
 
@@ -716,7 +846,7 @@ def test_openrouter_byok_falls_back_to_local_estimate_for_anthropic(sc, monkeypa
         api_key="or-test",
         base_url=sc.DEFAULT_API_BASE,
     )
-    _items, usage = sc._request_completion(cfg, "system", "user")
+    _items, usage = sc._request_completion(cfg, "system", "user", ["a"])
     # 4000 in @ $3/M + 1000 out @ $15/M = 0.012 + 0.015 = 0.027
     assert usage.cost_usd == pytest.approx(0.027)
     assert usage.estimated is True
@@ -763,7 +893,7 @@ def test_openrouter_zero_cost_non_anthropic_yields_none(sc, monkeypatch):
         api_key="or-test",
         base_url=sc.DEFAULT_API_BASE,
     )
-    _items, usage = sc._request_completion(cfg, "system", "user")
+    _items, usage = sc._request_completion(cfg, "system", "user", ["a"])
     assert usage.cost_usd is None
     assert usage.estimated is False
 
@@ -819,7 +949,7 @@ def test_openrouter_missing_cost_yields_none(sc, monkeypatch):
         api_key="k",
         base_url=sc.DEFAULT_API_BASE,
     )
-    _items, usage = sc._request_completion(cfg, "s", "u")
+    _items, usage = sc._request_completion(cfg, "s", "u", ["a"])
     assert usage.input_tokens == 100
     assert usage.output_tokens == 50
     assert usage.cost_usd is None
@@ -853,7 +983,7 @@ def test_openrouter_http_error_raises_apicallerror(sc, monkeypatch):
         base_url=sc.DEFAULT_API_BASE,
     )
     with pytest.raises(sc.APICallError):
-        sc._request_completion(cfg, "system", "user")
+        sc._request_completion(cfg, "system", "user", [])
 
 
 # ----------------------------------------------------------------------
