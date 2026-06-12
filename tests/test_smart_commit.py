@@ -249,6 +249,7 @@ def test_no_staged_changes_exits_cleanly(tmp_git_repo, sc, monkeypatch):
 def test_missing_api_key(tmp_git_repo, sc, monkeypatch):
     stage_files(tmp_git_repo, {"a.py": "1\n"})
     monkeypatch.delenv("SMART_COMMIT_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     rc = sc.main([])
     assert rc == sc.EXIT_USER_ERROR
 
@@ -409,10 +410,35 @@ def test_smart_commit_model_env_overrides_default(sc, tmp_path, monkeypatch):
 def test_missing_api_key_message(tmp_git_repo, sc, monkeypatch, capsys):
     stage_files(tmp_git_repo, {"a.py": "1\n"})
     monkeypatch.delenv("SMART_COMMIT_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     rc = sc.main([])
     assert rc == sc.EXIT_USER_ERROR
     err = capsys.readouterr().err
     assert "SMART_COMMIT_API_KEY" in err
+
+
+def test_openrouter_api_key_fallback(sc, tmp_path, monkeypatch):
+    monkeypatch.delenv("SMART_COMMIT_API_KEY", raising=False)
+    monkeypatch.delenv("SMART_COMMIT_API_BASE", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.api_key == "or-key"
+
+
+def test_openrouter_api_key_ignored_for_other_base(sc, tmp_path, monkeypatch):
+    monkeypatch.delenv("SMART_COMMIT_API_KEY", raising=False)
+    monkeypatch.setenv("SMART_COMMIT_API_BASE", "https://litellm.example.com/v1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.api_key == ""
+
+
+def test_smart_commit_api_key_wins_over_openrouter(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "sc-key")
+    monkeypatch.delenv("SMART_COMMIT_API_BASE", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.api_key == "sc-key"
 
 
 def test_openrouter_request_happy_path(sc, monkeypatch):
