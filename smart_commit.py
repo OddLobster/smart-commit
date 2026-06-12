@@ -520,8 +520,8 @@ Rules:
 - Use conventional commit format for the subject: type(scope): short imperative description.
 - Match the style of the recent commit log when one is provided.
 - If all changes are genuinely one concern, return a single commit.
-- Never include files that are not in the staged file list.
-- Each staged file MUST appear in EXACTLY ONE group.
+- The staged files are listed with numeric IDs. In "files", reference each file by its numeric ID — NEVER write file paths.
+- Each staged file ID MUST appear in EXACTLY ONE group.
 - Always include a "reasoning" field explaining why these files belong together (one short sentence).
 """
 
@@ -529,13 +529,13 @@ SYSTEM_PROMPT_VERBOSE = '- Set "body" to 1-3 sentences explaining what the chang
 SYSTEM_PROMPT_TERSE = '- Leave "body" as an empty string.\n'
 
 SYSTEM_PROMPT_SCHEMA = """
-Respond with a single JSON object matching this schema, and nothing else (no markdown fences, no commentary):
+Respond with a single JSON object matching this schema, and nothing else (no markdown fences, no commentary). "files" holds the numeric IDs of the staged files in that commit:
 
 {
   "commits": [
     {
       "message": "feat(api): add license validation endpoint",
-      "files": ["server/routes/license.py", "server/models/license.py"],
+      "files": [1, 3],
       "body": "",
       "reasoning": "These files together implement the license check feature."
     }
@@ -553,7 +553,7 @@ RESPONSE_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "message": {"type": "string"},
-                    "files": {"type": "array", "items": {"type": "string"}},
+                    "files": {"type": "array", "items": {"type": "integer"}},
                     "body": {"type": "string"},
                     "reasoning": {"type": "string"},
                 },
@@ -599,7 +599,8 @@ def build_user_message(
         parts.append(f"## Recent commit style\n{recent_log.strip()}")
     if conventions.strip():
         parts.append(f"## Project conventions\n{conventions.strip()}")
-    parts.append("## Staged files\n" + "\n".join(files))
+    numbered = "\n".join(f"{i}. {f}" for i, f in enumerate(files, 1))
+    parts.append("## Staged files (reference by numeric ID)\n" + numbered)
     parts.append(f"## Full diff\n{diff}")
     return "\n\n".join(parts)
 
@@ -610,6 +611,33 @@ def _strip_json_fences(text: str) -> str:
     text = re.sub(r"^```(?:json|JSON)?\s*\n?", "", text)
     text = re.sub(r"\n?```\s*$", "", text)
     return text.strip()
+
+
+def _resolve_file_ref(ref, files: list[str]) -> str:
+    """Map a model file reference (1-based numeric ID) to a staged path.
+
+    The model is asked for numeric IDs so it can never invent a path — an ID
+    either resolves to a real staged file or raises. As a courtesy to models
+    that ignore the schema, a string that exactly matches a staged path (or
+    is a stringified ID) is also accepted; anything else is an error.
+    """
+    if isinstance(ref, bool):
+        raise ValueError(f"invalid file reference {ref!r}")
+    if isinstance(ref, str):
+        s = ref.strip()
+        if s in files:
+            return s
+        try:
+            ref = int(s)
+        except ValueError:
+            raise ValueError(
+                f"file reference {s!r} is neither a numeric ID nor an exact staged path"
+            ) from None
+    if not isinstance(ref, int):
+        raise ValueError(f"invalid file reference {ref!r}")
+    if not 1 <= ref <= len(files):
+        raise ValueError(f"file ID {ref} is out of range (valid IDs: 1-{len(files)})")
+    return files[ref - 1]
 
 
 def _items_to_groups(items: list[dict]) -> list[CommitGroup]:
@@ -626,8 +654,16 @@ def _items_to_groups(items: list[dict]) -> list[CommitGroup]:
     return groups
 
 
-def _request_completion(config: Config, system: str, user: str) -> tuple[list[dict], Usage]:
-    """Call an OpenAI-compatible /chat/completions endpoint with one parse retry."""
+def _request_completion(
+    config: Config, system: str, user: str, files: list[str]
+) -> tuple[list[dict], Usage]:
+    """Call an OpenAI-compatible /chat/completions endpoint with one parse retry.
+
+    The model returns numeric file IDs; they are resolved to real staged
+    paths here (see _resolve_file_ref), so returned items always carry
+    verbatim staged paths. Unresolvable references count as a parse failure
+    and trigger the same single corrective retry as malformed JSON.
+    """
     headers = {
         "Authorization": f"Bearer {config.api_key}",
         "Content-Type": "application/json",
@@ -684,9 +720,12 @@ def _request_completion(config: Config, system: str, user: str) -> tuple[list[di
         cleaned = _strip_json_fences(text)
         try:
             parsed = json.loads(cleaned)
+            items = [dict(item) for item in parsed["commits"]]
+            for item in items:
+                item["files"] = [_resolve_file_ref(r, files) for r in item["files"]]
             usage = _extract_usage(data, model=config.model)
-            return list(parsed["commits"]), usage
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            return items, usage
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             last_error = str(e)
             if attempt == 0:
                 # Append the bad assistant turn and ask for a clean retry.
@@ -694,8 +733,11 @@ def _request_completion(config: Config, system: str, user: str) -> tuple[list[di
                 messages.append({
                     "role": "user",
                     "content": (
-                        "Your previous response was not valid JSON matching the schema. "
-                        "Respond with ONLY the JSON object, no markdown fences, no commentary."
+                        f"Your previous response was invalid: {last_error}. "
+                        "Respond with ONLY the JSON object matching the schema — no "
+                        "markdown fences, no commentary. In \"files\", reference each "
+                        "staged file by its numeric ID from the staged file list; do "
+                        "not write file paths."
                     ),
                 })
                 payload = {**payload, "messages": messages}
@@ -769,7 +811,7 @@ def request_grouping(
 ) -> tuple[list[CommitGroup], Usage]:
     system = build_system_prompt(config.verbose_messages)
     user = build_user_message(diff, files, recent_log, config.conventions, config.context)
-    items, usage = _request_completion(config, system, user)
+    items, usage = _request_completion(config, system, user, files)
     return _items_to_groups(items), usage
 
 
