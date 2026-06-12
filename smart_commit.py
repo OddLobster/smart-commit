@@ -467,12 +467,14 @@ def build_config(args: argparse.Namespace, repo_root: Path) -> Config:
     )
     cfg.model = resolve_model(raw_model)
 
-    cfg.api_key = os.environ.get("SMART_COMMIT_API_KEY", "")
     cfg.base_url = (
         os.environ.get("SMART_COMMIT_API_BASE")
         or str(raw.get("api_base", "")).strip()
         or DEFAULT_API_BASE
     )
+    cfg.api_key = os.environ.get("SMART_COMMIT_API_KEY", "")
+    if not cfg.api_key and "openrouter.ai" in cfg.base_url:
+        cfg.api_key = os.environ.get("OPENROUTER_API_KEY", "")
 
     cfg.auto = bool(args.auto) or os.environ.get("SMART_COMMIT_AUTO", "").lower() in ("1", "true", "yes") or bool(raw.get("auto", False))
     cfg.dry_run = bool(args.dry_run)
@@ -1348,10 +1350,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if not config.api_key:
         print(
-            "error: SMART_COMMIT_API_KEY is not set. "
-            "Set it to a key for any OpenAI-compatible /chat/completions endpoint "
-            "(default endpoint is OpenRouter — get a key at https://openrouter.ai/keys). "
-            "Then `export SMART_COMMIT_API_KEY=...`",
+            "error: no API key found. Set SMART_COMMIT_API_KEY to a key for any "
+            "OpenAI-compatible /chat/completions endpoint, or OPENROUTER_API_KEY "
+            "when using the default OpenRouter endpoint "
+            "(get a key at https://openrouter.ai/keys).",
             file=sys.stderr,
         )
         return EXIT_USER_ERROR

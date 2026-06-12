@@ -2,7 +2,7 @@
 # PYTHON_ARGCOMPLETE_OK
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["anthropic>=0.40", "httpx>=0.27", "argcomplete>=3.0"]
+# dependencies = ["httpx>=0.27", "argcomplete>=3.0"]
 # ///
 """smart-commit: split staged git changes into atomic commits using an LLM."""
 
@@ -22,78 +22,54 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import anthropic
 import argcomplete
 import httpx
 
-PROVIDER_ANTHROPIC = "anthropic"
-PROVIDER_OPENROUTER = "openrouter"
-VALID_PROVIDERS = (PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER)
+DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
+DEFAULT_MODEL = "qwen/qwen3.6-flash"
 
-DEFAULT_MODEL_BY_PROVIDER = {
-    PROVIDER_ANTHROPIC: "claude-sonnet-4-6",
-    PROVIDER_OPENROUTER: "anthropic/claude-sonnet-4.6",
-}
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-
-# Short aliases for the --model flag. Resolve provider-aware so `haiku` Just
-# Works whether the user is on Anthropic direct or via OpenRouter. Anything
-# not in this map (e.g. `openai/gpt-5`, `qwen/qwen3-vl-plus`) passes through.
-MODEL_ALIASES: dict[str, dict[str, str]] = {
-    PROVIDER_ANTHROPIC: {
-        "haiku": "claude-haiku-4-5",
-        "sonnet": "claude-sonnet-4-6",
-        "opus": "claude-opus-4-7",
-    },
-    PROVIDER_OPENROUTER: {
-        "haiku": "anthropic/claude-haiku-4.5",
-        "sonnet": "anthropic/claude-sonnet-4.6",
-        "opus": "anthropic/claude-opus-4.7",
-    },
+# Short aliases for the --model flag. Resolve to OpenRouter-style IDs since
+# the default endpoint is OpenRouter; anything not in this map (a full
+# OpenRouter ID like `openai/gpt-5`, or a bare ID for a custom base_url)
+# passes through unchanged.
+MODEL_ALIASES: dict[str, str] = {
+    "haiku": "anthropic/claude-haiku-4.5",
+    "sonnet": "anthropic/claude-sonnet-4.6",
+    "opus": "anthropic/claude-opus-4.7",
 }
 
 # Curated suggestions for shell tab-completion on `--model`. Not authoritative
-# — anything OpenRouter exposes is still a valid value, this is just the list
+# — anything the configured endpoint exposes is valid; this is just the list
 # we surface on tab. Aliases come first so `<tab><tab>` short-cycles them.
-MODEL_COMPLETION_HINTS: dict[str, list[str]] = {
-    PROVIDER_ANTHROPIC: [
-        "haiku",
-        "sonnet",
-        "opus",
-        "claude-haiku-4-5",
-        "claude-sonnet-4-6",
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-    ],
-    PROVIDER_OPENROUTER: [
-        "haiku",
-        "sonnet",
-        "opus",
-        "anthropic/claude-haiku-4.5",
-        "anthropic/claude-sonnet-4.6",
-        "anthropic/claude-opus-4.6",
-        "anthropic/claude-opus-4.7",
-        "openai/gpt-5",
-        "openai/gpt-5.5",
-        "openai/o4-mini",
-        "openai/gpt-4.1",
-        "google/gemini-2.5-pro",
-        "google/gemini-2.5-flash",
-        "google/gemini-3.1-pro-preview",
-        "deepseek/deepseek-r1",
-        "deepseek/deepseek-v4-pro",
-        "meta-llama/llama-4-maverick",
-        "qwen/qwen3-coder",
-        "qwen/qwen3-max",
-        "x-ai/grok-4",
-        "mistralai/mistral-large",
-        "mistralai/devstral-medium",
-        "moonshotai/kimi-k2.6",
-    ],
-}
+MODEL_COMPLETION_HINTS: list[str] = [
+    "haiku",
+    "sonnet",
+    "opus",
+    "anthropic/claude-haiku-4.5",
+    "anthropic/claude-sonnet-4.6",
+    "anthropic/claude-opus-4.6",
+    "anthropic/claude-opus-4.7",
+    "openai/gpt-5",
+    "openai/gpt-5.5",
+    "openai/o4-mini",
+    "openai/gpt-4.1",
+    "google/gemini-2.5-pro",
+    "google/gemini-2.5-flash",
+    "google/gemini-3.1-pro-preview",
+    "deepseek/deepseek-r1",
+    "deepseek/deepseek-v4-pro",
+    "meta-llama/llama-4-maverick",
+    "qwen/qwen3-coder",
+    "qwen/qwen3-max",
+    "x-ai/grok-4",
+    "mistralai/mistral-large",
+    "mistralai/devstral-medium",
+    "moonshotai/kimi-k2.6",
+]
 
-# Prices in USD per million tokens (input, output). Used only for the
-# Anthropic provider — OpenRouter returns actual cost on the response.
+# Prices in USD per million tokens (input, output). The endpoint normally
+# returns actual cost on the response; this table is only a BYOK/free-tier
+# fallback estimate for `anthropic/*` models routed through OpenRouter.
 ANTHROPIC_PRICING: dict[str, tuple[float, float]] = {
     "claude-opus-4-7": (5.00, 25.00),
     "claude-opus-4-6": (5.00, 25.00),
@@ -109,10 +85,11 @@ INIT_TEMPLATE = """\
 # smart-commit configuration. All keys are optional — defaults work fine.
 # Full reference: .smart-commit.toml.example in the smart-commit repo.
 
-# --- Provider & model ---------------------------------------------------
+# --- Model & endpoint ---------------------------------------------------
 
-# provider = "anthropic"     # or "openrouter"
 # model    = "sonnet"        # alias or full ID. SMART_COMMIT_MODEL env wins.
+# api_base = "https://openrouter.ai/api/v1"  # any OpenAI-compatible /chat/completions
+                                              # endpoint. SMART_COMMIT_API_BASE env wins.
 
 # --- Per-branch context (optional) --------------------------------------
 
@@ -168,7 +145,6 @@ EXIT_VALIDATION_ERROR = 4
 
 @dataclass
 class Config:
-    provider: str = PROVIDER_ANTHROPIC
     model: str = ""
     api_key: str = ""
     base_url: str = ""
@@ -205,30 +181,16 @@ class Usage:
 # ======================================================================
 
 
-def resolve_model(name: str, provider: str) -> str:
-    """Expand a short alias (`haiku`, `sonnet`, `opus`) to a provider-specific ID."""
+def resolve_model(name: str) -> str:
+    """Expand a short alias (`haiku`, `sonnet`, `opus`) to a full model ID."""
     if not name:
         return name
-    aliases = MODEL_ALIASES.get(provider, {})
-    return aliases.get(name.strip().lower(), name)
-
-
-def _resolve_provider_for_completion(parsed_args) -> str:
-    """Best-effort provider resolution during shell completion (no config-file read)."""
-    p = (
-        getattr(parsed_args, "provider", None)
-        or os.environ.get("SMART_COMMIT_PROVIDER", "").strip().lower()
-    )
-    if p in VALID_PROVIDERS:
-        return p
-    if os.environ.get("OPENROUTER_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
-        return PROVIDER_OPENROUTER
-    return PROVIDER_ANTHROPIC
+    return MODEL_ALIASES.get(name.strip().lower(), name)
 
 
 def _model_completer(prefix, parsed_args, **kwargs):  # noqa: ARG001
-    """argcomplete hook for `--model`: suggest provider-appropriate model IDs."""
-    return MODEL_COMPLETION_HINTS[_resolve_provider_for_completion(parsed_args)]
+    """argcomplete hook for `--model`: suggest the curated list of model IDs."""
+    return MODEL_COMPLETION_HINTS
 
 
 def anthropic_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
@@ -493,51 +455,26 @@ def load_config(repo_root: Path) -> dict:
         return {}
 
 
-def _resolve_provider(args: argparse.Namespace, raw: dict) -> str:
-    """Resolve provider from CLI > env > config > auto-detect."""
-    if getattr(args, "provider", None):
-        return args.provider
-    env = os.environ.get("SMART_COMMIT_PROVIDER", "").strip().lower()
-    if env:
-        return env
-    if raw.get("provider"):
-        return str(raw["provider"]).strip().lower()
-    # Auto-detect: if exactly one key is set, use that provider.
-    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
-    if has_openrouter and not has_anthropic:
-        return PROVIDER_OPENROUTER
-    return PROVIDER_ANTHROPIC
-
-
 def build_config(args: argparse.Namespace, repo_root: Path) -> Config:
     raw = load_config(repo_root)
     cfg = Config()
-
-    cfg.provider = _resolve_provider(args, raw)
-    if cfg.provider not in VALID_PROVIDERS:
-        raise ValueError(
-            f"unknown provider '{cfg.provider}'. Valid: {', '.join(VALID_PROVIDERS)}"
-        )
 
     raw_model = (
         getattr(args, "model", None)
         or os.environ.get("SMART_COMMIT_MODEL")
         or str(raw.get("model", "")).strip()
-        or DEFAULT_MODEL_BY_PROVIDER[cfg.provider]
+        or DEFAULT_MODEL
     )
-    cfg.model = resolve_model(raw_model, cfg.provider)
+    cfg.model = resolve_model(raw_model)
 
-    if cfg.provider == PROVIDER_ANTHROPIC:
-        cfg.api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        cfg.base_url = ""
-    else:  # openrouter
+    cfg.base_url = (
+        os.environ.get("SMART_COMMIT_API_BASE")
+        or str(raw.get("api_base", "")).strip()
+        or DEFAULT_API_BASE
+    )
+    cfg.api_key = os.environ.get("SMART_COMMIT_API_KEY", "")
+    if not cfg.api_key and "openrouter.ai" in cfg.base_url:
         cfg.api_key = os.environ.get("OPENROUTER_API_KEY", "")
-        cfg.base_url = (
-            os.environ.get("SMART_COMMIT_BASE_URL")
-            or str(raw.get("base_url", "")).strip()
-            or OPENROUTER_BASE_URL
-        )
 
     cfg.auto = bool(args.auto) or os.environ.get("SMART_COMMIT_AUTO", "").lower() in ("1", "true", "yes") or bool(raw.get("auto", False))
     cfg.dry_run = bool(args.dry_run)
@@ -585,8 +522,8 @@ Rules:
 - Use conventional commit format for the subject: type(scope): short imperative description.
 - Match the style of the recent commit log when one is provided.
 - If all changes are genuinely one concern, return a single commit.
-- Never include files that are not in the staged file list.
-- Each staged file MUST appear in EXACTLY ONE group.
+- The staged files are listed with numeric IDs. In "files", reference each file by its numeric ID — NEVER write file paths.
+- Each staged file ID MUST appear in EXACTLY ONE group.
 - Always include a "reasoning" field explaining why these files belong together (one short sentence).
 """
 
@@ -594,13 +531,13 @@ SYSTEM_PROMPT_VERBOSE = '- Set "body" to 1-3 sentences explaining what the chang
 SYSTEM_PROMPT_TERSE = '- Leave "body" as an empty string.\n'
 
 SYSTEM_PROMPT_SCHEMA = """
-Respond with a single JSON object matching this schema, and nothing else (no markdown fences, no commentary):
+Respond with a single JSON object matching this schema, and nothing else (no markdown fences, no commentary). "files" holds the numeric IDs of the staged files in that commit:
 
 {
   "commits": [
     {
       "message": "feat(api): add license validation endpoint",
-      "files": ["server/routes/license.py", "server/models/license.py"],
+      "files": [1, 3],
       "body": "",
       "reasoning": "These files together implement the license check feature."
     }
@@ -618,7 +555,7 @@ RESPONSE_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "message": {"type": "string"},
-                    "files": {"type": "array", "items": {"type": "string"}},
+                    "files": {"type": "array", "items": {"type": "integer"}},
                     "body": {"type": "string"},
                     "reasoning": {"type": "string"},
                 },
@@ -664,7 +601,8 @@ def build_user_message(
         parts.append(f"## Recent commit style\n{recent_log.strip()}")
     if conventions.strip():
         parts.append(f"## Project conventions\n{conventions.strip()}")
-    parts.append("## Staged files\n" + "\n".join(files))
+    numbered = "\n".join(f"{i}. {f}" for i, f in enumerate(files, 1))
+    parts.append("## Staged files (reference by numeric ID)\n" + numbered)
     parts.append(f"## Full diff\n{diff}")
     return "\n\n".join(parts)
 
@@ -675,6 +613,33 @@ def _strip_json_fences(text: str) -> str:
     text = re.sub(r"^```(?:json|JSON)?\s*\n?", "", text)
     text = re.sub(r"\n?```\s*$", "", text)
     return text.strip()
+
+
+def _resolve_file_ref(ref, files: list[str]) -> str:
+    """Map a model file reference (1-based numeric ID) to a staged path.
+
+    The model is asked for numeric IDs so it can never invent a path — an ID
+    either resolves to a real staged file or raises. As a courtesy to models
+    that ignore the schema, a string that exactly matches a staged path (or
+    is a stringified ID) is also accepted; anything else is an error.
+    """
+    if isinstance(ref, bool):
+        raise ValueError(f"invalid file reference {ref!r}")
+    if isinstance(ref, str):
+        s = ref.strip()
+        if s in files:
+            return s
+        try:
+            ref = int(s)
+        except ValueError:
+            raise ValueError(
+                f"file reference {s!r} is neither a numeric ID nor an exact staged path"
+            ) from None
+    if not isinstance(ref, int):
+        raise ValueError(f"invalid file reference {ref!r}")
+    if not 1 <= ref <= len(files):
+        raise ValueError(f"file ID {ref} is out of range (valid IDs: 1-{len(files)})")
+    return files[ref - 1]
 
 
 def _items_to_groups(items: list[dict]) -> list[CommitGroup]:
@@ -691,32 +656,16 @@ def _items_to_groups(items: list[dict]) -> list[CommitGroup]:
     return groups
 
 
-def _request_anthropic(config: Config, system: str, user: str) -> tuple[list[dict], Usage]:
-    client = anthropic.Anthropic(api_key=config.api_key)
-    try:
-        response = client.messages.create(
-            model=config.model,
-            max_tokens=MAX_TOKENS,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            output_config={"format": {"type": "json_schema", "schema": RESPONSE_SCHEMA}},
-        )
-    except anthropic.APIError as e:
-        raise APICallError(str(e)) from e
-    text = "".join(b.text for b in response.content if b.type == "text").strip()
-    data = json.loads(text)
-    in_tok = getattr(response.usage, "input_tokens", 0) or 0
-    out_tok = getattr(response.usage, "output_tokens", 0) or 0
-    usage = Usage(
-        input_tokens=in_tok,
-        output_tokens=out_tok,
-        cost_usd=anthropic_cost(config.model, in_tok, out_tok),
-    )
-    return list(data["commits"]), usage
+def _request_completion(
+    config: Config, system: str, user: str, files: list[str]
+) -> tuple[list[dict], Usage]:
+    """Call an OpenAI-compatible /chat/completions endpoint with one parse retry.
 
-
-def _request_openrouter(config: Config, system: str, user: str) -> tuple[list[dict], Usage]:
-    """Call OpenRouter (or any OpenAI-compatible endpoint) with one parse retry."""
+    The model returns numeric file IDs; they are resolved to real staged
+    paths here (see _resolve_file_ref), so returned items always carry
+    verbatim staged paths. Unresolvable references count as a parse failure
+    and trigger the same single corrective retry as malformed JSON.
+    """
     headers = {
         "Authorization": f"Bearer {config.api_key}",
         "Content-Type": "application/json",
@@ -773,9 +722,12 @@ def _request_openrouter(config: Config, system: str, user: str) -> tuple[list[di
         cleaned = _strip_json_fences(text)
         try:
             parsed = json.loads(cleaned)
-            usage = _openrouter_usage(data, model=config.model)
-            return list(parsed["commits"]), usage
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            items = [dict(item) for item in parsed["commits"]]
+            for item in items:
+                item["files"] = [_resolve_file_ref(r, files) for r in item["files"]]
+            usage = _extract_usage(data, model=config.model)
+            return items, usage
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             last_error = str(e)
             if attempt == 0:
                 # Append the bad assistant turn and ask for a clean retry.
@@ -783,8 +735,11 @@ def _request_openrouter(config: Config, system: str, user: str) -> tuple[list[di
                 messages.append({
                     "role": "user",
                     "content": (
-                        "Your previous response was not valid JSON matching the schema. "
-                        "Respond with ONLY the JSON object, no markdown fences, no commentary."
+                        f"Your previous response was invalid: {last_error}. "
+                        "Respond with ONLY the JSON object matching the schema — no "
+                        "markdown fences, no commentary. In \"files\", reference each "
+                        "staged file by its numeric ID from the staged file list; do "
+                        "not write file paths."
                     ),
                 })
                 payload = {**payload, "messages": messages}
@@ -802,8 +757,8 @@ def _safe_float(v) -> float | None:
         return None
 
 
-def _openrouter_usage(data: dict, model: str = "") -> Usage:
-    """Extract usage from an OpenRouter chat-completion response.
+def _extract_usage(data: dict, model: str = "") -> Usage:
+    """Extract usage from an OpenAI-compatible chat-completion response.
 
     OpenRouter reports cost in two places (per their usage-accounting docs):
       - `usage.cost`: what OpenRouter charges the user (zero for BYOK and
@@ -858,10 +813,7 @@ def request_grouping(
 ) -> tuple[list[CommitGroup], Usage]:
     system = build_system_prompt(config.verbose_messages)
     user = build_user_message(diff, files, recent_log, config.conventions, config.context)
-    if config.provider == PROVIDER_OPENROUTER:
-        items, usage = _request_openrouter(config, system, user)
-    else:
-        items, usage = _request_anthropic(config, system, user)
+    items, usage = _request_completion(config, system, user, files)
     return _items_to_groups(items), usage
 
 
@@ -1178,19 +1130,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="Force single-line commit messages (override config).",
     )
-    parser.add_argument(
-        "--provider",
-        choices=VALID_PROVIDERS,
-        default=None,
-        help="Override SMART_COMMIT_PROVIDER for this run (anthropic | openrouter).",
-    )
     model_arg = parser.add_argument(
         "--model",
         default=None,
         help=(
             "Override the model for this run. Accepts full IDs "
-            "(e.g. 'claude-opus-4-7', 'openai/gpt-5') or short aliases "
-            "('haiku', 'sonnet', 'opus'), which resolve to provider-specific IDs."
+            "(e.g. 'anthropic/claude-opus-4.7', 'openai/gpt-5') or short aliases "
+            "('haiku', 'sonnet', 'opus')."
         ),
     )
     model_arg.completer = _model_completer  # type: ignore[attr-defined]
@@ -1319,11 +1265,7 @@ def cmd_set_model(repo_root: Path, raw_model: str) -> int:
     config_path = repo_root / CONFIG_FILENAME
 
     # Resolve the alias so the stored value is a concrete model ID.
-    raw = load_config(repo_root)
-    provider = str(raw.get("provider", "")).strip().lower() or PROVIDER_ANTHROPIC
-    if os.environ.get("SMART_COMMIT_PROVIDER"):
-        provider = os.environ["SMART_COMMIT_PROVIDER"].strip().lower()
-    model = resolve_model(raw_model, provider)
+    model = resolve_model(raw_model)
 
     if not config_path.exists():
         config_path.write_text(f'model = "{model}"\n')
@@ -1354,7 +1296,7 @@ def cmd_init(repo_root: Path) -> int:
     target.write_text(INIT_TEMPLATE)
     print(f"Created {target}")
     print(
-        "Edit it to customize provider, model, conventions, trailers, etc. "
+        "Edit it to customize model, conventions, trailers, etc. "
         "All keys are optional — leaving the file empty also silences the setup hint."
     )
     return EXIT_OK
@@ -1407,31 +1349,18 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USER_ERROR
 
     if not config.api_key:
-        if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("OPENROUTER_API_KEY"):
-            print(
-                "error: no API key set. Set one of:\n"
-                "  ANTHROPIC_API_KEY  (get one at https://console.anthropic.com/)\n"
-                "  OPENROUTER_API_KEY (get one at https://openrouter.ai/keys)\n"
-                "Then `export ANTHROPIC_API_KEY=...` or `export OPENROUTER_API_KEY=...`",
-                file=sys.stderr,
-            )
-        elif config.provider == PROVIDER_OPENROUTER:
-            print(
-                "error: OPENROUTER_API_KEY is not set. "
-                "Get one at https://openrouter.ai/keys and `export OPENROUTER_API_KEY=...`",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                "error: ANTHROPIC_API_KEY is not set. "
-                "Get one at https://console.anthropic.com/ and `export ANTHROPIC_API_KEY=...`",
-                file=sys.stderr,
-            )
+        print(
+            "error: no API key found. Set SMART_COMMIT_API_KEY to a key for any "
+            "OpenAI-compatible /chat/completions endpoint, or OPENROUTER_API_KEY "
+            "when using the default OpenRouter endpoint "
+            "(get a key at https://openrouter.ai/keys).",
+            file=sys.stderr,
+        )
         return EXIT_USER_ERROR
 
     n = len(staged)
     suffix = "" if n == 1 else "s"
-    print(f"Analyzing {n} staged file{suffix} via {config.provider} ({config.model})...")
+    print(f"Analyzing {n} staged file{suffix} using {config.model}...")
     if config.context:
         print(f'Context: "{config.context}"')
     print()
