@@ -64,6 +64,15 @@ def stage_files(repo: Path, files: dict[str, str]) -> None:
     _git(repo, "add", *files.keys())
 
 
+def stage_binary_file(repo: Path, rel: str, size: int = 5000) -> None:
+    """Write and stage a file with real binary content (a NUL byte up front,
+    like a PNG header) so git's binary auto-detection treats it as binary."""
+    path = repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * (size // 256 + 1))
+    _git(repo, "add", rel)
+
+
 def commit_log_subjects(repo: Path) -> list[str]:
     result = subprocess.run(
         ["git", "log", "--format=%s"],

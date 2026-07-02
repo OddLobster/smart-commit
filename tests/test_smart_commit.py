@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from conftest import commit_body, commit_log_subjects, stage_files, staged_files
+from conftest import (
+    commit_body,
+    commit_log_subjects,
+    stage_binary_file,
+    stage_files,
+    staged_files,
+)
 
 
 # ----------------------------------------------------------------------
@@ -76,6 +82,19 @@ def test_truncate_diff_per_file(sc):
     out = sc.truncate_diff(a + b, max_bytes=100, head_tail=10)
     assert out.count("diff --git") == 2
     assert out.count("[... ") == 2
+
+
+def test_truncate_diff_clips_few_pathologically_long_lines(sc):
+    # A handful of lines (fewer than the head/tail line-count threshold) but
+    # each individually huge — e.g. binary content forced into a text diff
+    # by a gitattributes override. Line-count-based truncation alone would
+    # never touch this; it must be caught by the byte-size check instead.
+    huge_line = "+" + ("x" * 2_000_000)
+    diff = f"diff --git a/weird.bin b/weird.bin\n--- a/weird.bin\n+++ b/weird.bin\n@@ -0,0 +1 @@\n{huge_line}\n"
+    out = sc.truncate_diff(diff, max_bytes=1000)
+    assert len(out.encode("utf-8")) < 5000
+    assert "more chars truncated" in out
+    assert out.startswith("diff --git a/weird.bin b/weird.bin")
 
 
 def test_build_commit_message_subject_only(sc):
@@ -294,6 +313,51 @@ def test_rename_kept_in_one_group(tmp_git_repo, sc, monkeypatch):
     assert rc == sc.EXIT_OK
     assert "refactor: rename" in commit_log_subjects(tmp_git_repo)
     assert staged_files(tmp_git_repo) == []
+
+
+def test_git_staged_binary_paths_detects_binary_file(tmp_git_repo, sc):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    stage_binary_file(tmp_git_repo, "icon.png")
+
+    binary = sc.git_staged_binary_paths()
+    assert binary == {"icon.png"}
+
+
+def test_git_staged_diff_excludes_binary_content(tmp_git_repo, sc):
+    stage_files(tmp_git_repo, {"feature.py": "def f(): pass\n"})
+    stage_binary_file(tmp_git_repo, "icon.png", size=50_000)
+
+    diff = sc.git_staged_diff()
+
+    assert "def f(): pass" in diff
+    assert "diff --git a/icon.png b/icon.png" in diff
+    assert "Binary file (contents not included)" in diff
+    # Raw binary bytes must never appear — only the placeholder line.
+    assert len(diff) < 2000
+
+
+def test_binary_files_never_reach_the_model(tmp_git_repo, sc, monkeypatch):
+    """The diff string handed to request_grouping must stay small and
+    placeholder-only for staged binary files, even for a large PNG."""
+    stage_files(tmp_git_repo, {"feature.py": "def f(): pass\n"})
+    stage_binary_file(tmp_git_repo, "assets/icon.png", size=500_000)
+    captured: dict = {}
+
+    def fake_request_grouping(config, diff, files, recent_log):
+        captured["diff"] = diff
+        return (
+            [
+                sc.CommitGroup(message="feat: a", files=["feature.py"]),
+                sc.CommitGroup(message="chore: add icon", files=["assets/icon.png"]),
+            ],
+            sc.Usage(input_tokens=1, output_tokens=1, cost_usd=0.0),
+        )
+
+    monkeypatch.setattr(sc, "request_grouping", fake_request_grouping)
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    assert len(captured["diff"]) < 2000
+    assert "Binary file (contents not included)" in captured["diff"]
 
 
 def test_gitignored_but_staged_file_commits(tmp_git_repo, sc, monkeypatch):
