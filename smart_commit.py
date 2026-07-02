@@ -369,8 +369,62 @@ def git_staged_status() -> tuple[list[str], dict[str, str]]:
     return paths, rename_pairs
 
 
+def git_staged_binary_paths() -> set[str]:
+    """Return the set of staged paths git's diff engine treats as binary.
+
+    Uses `git diff --cached --numstat`, which marks binary files with '-'
+    counts — the same detection `git diff` itself uses to decide whether to
+    print a real patch or fall back to 'Binary files ... differ'. Renamed
+    files are keyed by their new path, matching git_staged_status().
+    """
+    result = run_git(["diff", "--cached", "--numstat", "-z"])
+    binary: set[str] = set()
+    tokens = result.stdout.split("\0")
+    i = 0
+    while i < len(tokens):
+        head = tokens[i]
+        if not head:
+            i += 1
+            continue
+        added, _, rest = head.partition("\t")
+        _deleted, _, path = rest.partition("\t")
+        is_binary = added == "-"
+        if path:
+            if is_binary:
+                binary.add(path)
+            i += 1
+        else:
+            # Rename: "<add>\t<del>\t" then old-path and new-path follow as
+            # separate NUL-terminated tokens.
+            if i + 2 >= len(tokens):
+                break
+            if is_binary:
+                binary.add(tokens[i + 2])
+            i += 3
+    return binary
+
+
 def git_staged_diff() -> str:
-    return run_git(["diff", "--cached"]).stdout
+    """Full unified diff of staged changes, with binary content excluded.
+
+    There's no useful signal in raw image/binary bytes for grouping commits,
+    so binary files get a one-line placeholder instead of a real diff. This
+    also guarantees binary content can never reach the model even if the
+    target repo's `.gitattributes` forces a `text` diff for it (which would
+    otherwise dump raw bytes as "text" — easily large enough to blow past a
+    model's input-length limit).
+    """
+    binary_paths = git_staged_binary_paths()
+    if not binary_paths:
+        return run_git(["diff", "--cached", "--no-textconv"]).stdout
+
+    exclude = [f":(exclude,literal){p}" for p in binary_paths]
+    text_diff = run_git(["diff", "--cached", "--no-textconv", "--", *exclude]).stdout
+    placeholders = "".join(
+        f"diff --git a/{p} b/{p}\nBinary file (contents not included)\n"
+        for p in sorted(binary_paths)
+    )
+    return text_diff + placeholders
 
 
 def git_recent_log(n: int = 20) -> str:
@@ -413,6 +467,15 @@ def git_commit_with_file(path: str) -> None:
 # ======================================================================
 
 
+MAX_DIFF_LINE_CHARS = 2000
+
+
+def _clip_line(line: str, max_chars: int = MAX_DIFF_LINE_CHARS) -> str:
+    if len(line) <= max_chars:
+        return line
+    return line[:max_chars] + f" [... {len(line) - max_chars} more chars truncated ...]"
+
+
 def truncate_diff(diff: str, max_bytes: int = MAX_DIFF_BYTES, head_tail: int = DIFF_HEAD_TAIL_LINES) -> str:
     """Truncate per-file diff sections when the full diff is too large."""
     if len(diff.encode("utf-8")) <= max_bytes:
@@ -425,7 +488,13 @@ def truncate_diff(diff: str, max_bytes: int = MAX_DIFF_BYTES, head_tail: int = D
             continue
         lines = section.splitlines()
         if len(lines) <= 2 * head_tail + 5:
-            parts.append(section.rstrip("\n"))
+            if len(section.encode("utf-8")) <= max_bytes:
+                parts.append(section.rstrip("\n"))
+            else:
+                # Few lines but still oversized — one or more pathologically
+                # long lines (e.g. binary content forced into a text diff).
+                # Line-count-based head/tail can't help here; clip each line.
+                parts.append("\n".join(_clip_line(l) for l in lines))
             continue
         head = lines[:head_tail]
         tail = lines[-head_tail:]
