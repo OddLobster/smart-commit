@@ -94,6 +94,7 @@ smart-commit [-n | --dry-run] [-y | --auto] [-v | --verbose | --no-verbose]
 |---|---|
 | `-n`, `--dry-run` | Print the plan and exit without committing. |
 | `-y`, `--auto` | Skip the interactive prompt and execute all commits. Equivalent to `SMART_COMMIT_AUTO=1`. |
+| `-p`, `--split-hunks` | Hunk-level splitting: individual diff hunks within a file can be assigned to different commits. Equivalent to `split_hunks = true` in config. |
 | `-v`, `--verbose` | Generate multi-line commit messages with a body paragraph. |
 | `--no-verbose` | Force single-line messages, overriding `verbose_messages = true` in config. |
 | `--provider` | One-shot override of `SMART_COMMIT_PROVIDER`. |
@@ -273,11 +274,25 @@ Reorder, edit, drop, or split commits. On save, the plan is re-validated
 (every staged file present in exactly one commit, no unknown files). If
 parsing or validation fails the editor reopens once before aborting.
 
+### Hunk-level splitting (`-p`)
+
+By default a file is fully in one commit or fully out. With `-p` /
+`--split-hunks` (or `split_hunks = true` in config), the model sees each
+diff hunk individually and can assign hunks from the same file to
+different commits. Commits are built by re-applying just each group's
+hunks to the index with `git apply --cached`, so unstaged working-tree
+changes are never touched. Binary files, renames, and mode-only changes
+stay whole-file units. If a file's hunks don't apply cleanly (e.g. after
+offsets shift), the whole file falls back to file-level staging in the
+commit that holds the majority of its hunks, with a warning — nothing is
+lost. `[E]dit` mode shows `hunks = [...]` lists (IDs like `app.py#2`)
+with a catalog of all hunks in the header comments.
+
 ## Scope (v1)
 
-- File-level grouping only. A file is fully in one commit or fully out — no
-  hunk splitting. Files with mixed concerns may produce a less-than-ideal
-  split; fix in `[E]dit` mode.
+- File-level grouping by default. Files with mixed concerns can be split
+  at hunk granularity with `-p` / `--split-hunks`, or fixed in `[E]dit`
+  mode.
 - `colocate` and `chore_glob` config keys are accepted but warned and ignored;
   they are planned for a follow-up.
 - `[S]kip` and `1`-`9` step-through actions from the original spec are

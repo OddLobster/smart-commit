@@ -25,6 +25,10 @@ Scopes: api, installer, ui, infra, docs.
 Always lowercase. No period at end of subject line.
 """
 
+# When true, individual diff hunks within a file can be assigned to
+# different commits. Same as passing -p / --split-hunks per run.
+# split_hunks = false
+
 # When true, generates a subject line + body paragraph per commit.
 # Override per-run with --verbose / --no-verbose.
 verbose_messages = false
