@@ -113,6 +113,12 @@ INIT_TEMPLATE = """\
 # Override per-run with -y / --auto, or SMART_COMMIT_AUTO=1.
 # auto = false
 
+# --- Hunk-level splitting -----------------------------------------------
+
+# When true, individual diff hunks within a file can be assigned to
+# different commits. Same as passing -p / --split-hunks per run.
+# split_hunks = false
+
 # --- Commit message style -----------------------------------------------
 
 # When true, generates subject + body per commit. Override per-run with
@@ -150,6 +156,7 @@ class Config:
     base_url: str = ""
     auto: bool = False
     dry_run: bool = False
+    split_hunks: bool = False
     verbose_messages: bool = False
     trailers: list[str] = field(default_factory=list)
     conventions: str = ""
@@ -166,6 +173,37 @@ class CommitGroup:
     files: list[str]
     body: str = ""
     reasoning: str = ""
+    hunks: list[str] = field(default_factory=list)  # unit IDs, --split-hunks mode only
+
+
+@dataclass
+class Hunk:
+    file: str
+    header: str  # the "@@ -l,s +l,s @@ ..." line, verbatim
+    lines: list[str] = field(default_factory=list)  # body lines, verbatim
+    hunk_id: str = ""  # "path#N", 1-based per file
+    seq: int = 0  # position within the file's hunk list, for stable ordering
+
+
+@dataclass
+class FilePatch:
+    path: str
+    header_lines: list[str]  # "diff --git" through "+++" (or fewer), verbatim
+    hunks: list[Hunk] = field(default_factory=list)
+
+
+@dataclass
+class HunkIndex:
+    """Assignable units for --split-hunks mode, in prompt order.
+
+    A unit is either a hunk ID ("path#N", present in `hunks`) or a bare
+    staged path for files with no splittable text diff (binary, rename,
+    mode-only change) — those are staged whole, like file-level mode.
+    """
+
+    units: list[str] = field(default_factory=list)
+    hunks: dict[str, Hunk] = field(default_factory=dict)
+    headers: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -321,13 +359,16 @@ class GitError(RuntimeError):
     pass
 
 
-def run_git(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+def run_git(
+    args: list[str], check: bool = True, input_text: str | None = None
+) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
             ["git", *args],
             check=check,
             capture_output=True,
             text=True,
+            input=input_text,
         )
     except subprocess.CalledProcessError as e:
         msg = (e.stderr or e.stdout or "").strip() or f"exit {e.returncode}"
@@ -369,8 +410,70 @@ def git_staged_status() -> tuple[list[str], dict[str, str]]:
     return paths, rename_pairs
 
 
+def git_staged_binary_paths() -> set[str]:
+    """Return the set of staged paths git's diff engine treats as binary.
+
+    Uses `git diff --cached --numstat`, which marks binary files with '-'
+    counts — the same detection `git diff` itself uses to decide whether to
+    print a real patch or fall back to 'Binary files ... differ'. Renamed
+    files are keyed by their new path, matching git_staged_status().
+    """
+    result = run_git(["diff", "--cached", "--numstat", "-z"])
+    binary: set[str] = set()
+    tokens = result.stdout.split("\0")
+    i = 0
+    while i < len(tokens):
+        head = tokens[i]
+        if not head:
+            i += 1
+            continue
+        added, _, rest = head.partition("\t")
+        _deleted, _, path = rest.partition("\t")
+        is_binary = added == "-"
+        if path:
+            if is_binary:
+                binary.add(path)
+            i += 1
+        else:
+            # Rename: "<add>\t<del>\t" then old-path and new-path follow as
+            # separate NUL-terminated tokens.
+            if i + 2 >= len(tokens):
+                break
+            if is_binary:
+                binary.add(tokens[i + 2])
+            i += 3
+    return binary
+
+
 def git_staged_diff() -> str:
-    return run_git(["diff", "--cached"]).stdout
+    """Full unified diff of staged changes, with binary content excluded.
+
+    There's no useful signal in raw image/binary bytes for grouping commits,
+    so binary files get a one-line placeholder instead of a real diff. This
+    also guarantees binary content can never reach the model even if the
+    target repo's `.gitattributes` forces a `text` diff for it (which would
+    otherwise dump raw bytes as "text" — easily large enough to blow past a
+    model's input-length limit).
+    """
+    # Force standard a/ b/ path prefixes so --split-hunks patch
+    # reconstruction (applied with git apply's default -p1) keeps working
+    # in repos that set diff.noprefix or diff.mnemonicPrefix.
+    diff_args = [
+        "-c", "diff.noprefix=false",
+        "-c", "diff.mnemonicprefix=false",
+        "diff", "--cached", "--no-textconv",
+    ]
+    binary_paths = git_staged_binary_paths()
+    if not binary_paths:
+        return run_git(diff_args).stdout
+
+    exclude = [f":(exclude,literal){p}" for p in binary_paths]
+    text_diff = run_git([*diff_args, "--", *exclude]).stdout
+    placeholders = "".join(
+        f"diff --git a/{p} b/{p}\nBinary file (contents not included)\n"
+        for p in sorted(binary_paths)
+    )
+    return text_diff + placeholders
 
 
 def git_recent_log(n: int = 20) -> str:
@@ -400,6 +503,11 @@ def git_add_all(paths: list[str]) -> None:
     run_git(["add", "-A", "-f", "--", *paths])
 
 
+def git_apply_cached(patch: str) -> None:
+    """Apply a patch to the index only (working tree untouched)."""
+    run_git(["apply", "--cached", "--whitespace=nowarn", "-"], input_text=patch)
+
+
 def git_commit_with_message(message: str) -> None:
     run_git(["commit", "-m", message])
 
@@ -411,6 +519,15 @@ def git_commit_with_file(path: str) -> None:
 # ======================================================================
 # Diff truncation
 # ======================================================================
+
+
+MAX_DIFF_LINE_CHARS = 2000
+
+
+def _clip_line(line: str, max_chars: int = MAX_DIFF_LINE_CHARS) -> str:
+    if len(line) <= max_chars:
+        return line
+    return line[:max_chars] + f" [... {len(line) - max_chars} more chars truncated ...]"
 
 
 def truncate_diff(diff: str, max_bytes: int = MAX_DIFF_BYTES, head_tail: int = DIFF_HEAD_TAIL_LINES) -> str:
@@ -425,7 +542,13 @@ def truncate_diff(diff: str, max_bytes: int = MAX_DIFF_BYTES, head_tail: int = D
             continue
         lines = section.splitlines()
         if len(lines) <= 2 * head_tail + 5:
-            parts.append(section.rstrip("\n"))
+            if len(section.encode("utf-8")) <= max_bytes:
+                parts.append(section.rstrip("\n"))
+            else:
+                # Few lines but still oversized — one or more pathologically
+                # long lines (e.g. binary content forced into a text diff).
+                # Line-count-based head/tail can't help here; clip each line.
+                parts.append("\n".join(_clip_line(l) for l in lines))
             continue
         head = lines[:head_tail]
         tail = lines[-head_tail:]
@@ -436,6 +559,129 @@ def truncate_diff(diff: str, max_bytes: int = MAX_DIFF_BYTES, head_tail: int = D
             + "\n".join(tail)
         )
     return "\n".join(parts) + "\n"
+
+
+# ======================================================================
+# Hunk parsing + patch reconstruction (--split-hunks)
+# ======================================================================
+
+
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+
+
+def _diff_section_path(header_lines: list[str]) -> str | None:
+    """Extract the path a diff section applies to.
+
+    Prefers the `+++ b/...` line (post-image path); falls back to
+    `--- a/...` for deletions, then to the `diff --git a/X b/X` line for
+    sections without a ---/+++ pair (binary placeholders, mode-only
+    changes). Paths git C-quotes get a minimal unescape; if the result
+    doesn't match a staged path the file just degrades to a whole-file
+    unit, so exotic names are safe either way.
+    """
+    minus = plus = None
+    for line in header_lines:
+        if line.startswith("+++ "):
+            plus = line[4:]
+        elif line.startswith("--- "):
+            minus = line[4:]
+    for raw, prefix in ((plus, "b/"), (minus, "a/")):
+        if raw is None or raw == "/dev/null":
+            continue
+        path = raw
+        if path.startswith('"') and path.endswith('"'):
+            path = (
+                path[1:-1]
+                .replace('\\"', '"')
+                .replace("\\t", "\t")
+                .replace("\\n", "\n")
+                .replace("\\\\", "\\")
+            )
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+        return path
+    m = re.match(r"^diff --git a/(.*) b/(.*)$", header_lines[0])
+    if m:
+        return m.group(2)
+    return None
+
+
+def parse_staged_hunks(diff: str) -> list[FilePatch]:
+    """Parse `git diff --cached` output into per-file patches with hunks.
+
+    Header lines and hunk bodies are kept verbatim so patches can be
+    reassembled byte-for-byte. Sections without any @@ hunk (binary
+    placeholders, mode-only changes, pure renames) come back with an
+    empty hunk list; callers treat those files as whole-file units.
+    """
+    patches: list[FilePatch] = []
+    for section in re.split(r"(?m)^(?=diff --git )", diff):
+        if not section.strip():
+            continue
+        # split("\n"), not splitlines(): diff content may contain form
+        # feeds etc. that splitlines() would treat as line boundaries.
+        lines = section.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        first_hunk = next(
+            (i for i, l in enumerate(lines) if _HUNK_HEADER_RE.match(l)), None
+        )
+        header_lines = lines if first_hunk is None else lines[:first_hunk]
+        path = _diff_section_path(header_lines)
+        if path is None:
+            continue
+        hunks: list[Hunk] = []
+        if first_hunk is not None:
+            current: Hunk | None = None
+            for line in lines[first_hunk:]:
+                if _HUNK_HEADER_RE.match(line):
+                    seq = len(hunks) + 1
+                    current = Hunk(
+                        file=path,
+                        header=line,
+                        lines=[],
+                        hunk_id=f"{path}#{seq}",
+                        seq=seq,
+                    )
+                    hunks.append(current)
+                else:
+                    current.lines.append(line)
+        patches.append(FilePatch(path=path, header_lines=header_lines, hunks=hunks))
+    return patches
+
+
+def build_hunk_index(
+    staged: list[str], rename_pairs: dict[str, str], diff: str
+) -> HunkIndex:
+    """Map staged files to assignable units.
+
+    Files with a parseable text diff contribute one unit per hunk;
+    everything else (binary, mode-only, unparseable) is a single
+    whole-file unit. Renamed files also stay whole-file units — the
+    rename itself must land in exactly one commit.
+    """
+    by_path = {fp.path: fp for fp in parse_staged_hunks(diff)}
+    renamed = set(rename_pairs.values())
+    index = HunkIndex()
+    for path in staged:
+        fp = by_path.get(path)
+        if fp is None or not fp.hunks or path in renamed:
+            index.units.append(path)
+            continue
+        index.headers[path] = fp.header_lines
+        for h in fp.hunks:
+            index.units.append(h.hunk_id)
+            index.hunks[h.hunk_id] = h
+    return index
+
+
+def build_file_patch(header_lines: list[str], hunks: list[Hunk]) -> str:
+    """Reassemble a valid patch from a file's headers and a subset of hunks."""
+    lines = list(header_lines)
+    for h in sorted(hunks, key=lambda h: h.seq):
+        lines.append(h.header)
+        lines.extend(h.lines)
+    return "\n".join(lines) + "\n"
 
 
 # ======================================================================
@@ -480,6 +726,10 @@ def build_config(args: argparse.Namespace, repo_root: Path) -> Config:
     cfg.dry_run = bool(args.dry_run)
     if cfg.dry_run:
         cfg.auto = False  # dry-run wins
+
+    cfg.split_hunks = bool(getattr(args, "split_hunks", False)) or bool(
+        raw.get("split_hunks", False)
+    )
 
     if args.verbose is not None:
         cfg.verbose_messages = args.verbose
@@ -546,6 +796,37 @@ Respond with a single JSON object matching this schema, and nothing else (no mar
 """
 
 
+SYSTEM_PROMPT_BASE_HUNKS = """You are a git commit splitter. Given the staged changes as a list of diff hunks, group the hunks into semantically distinct commits.
+
+Rules:
+- Each group represents ONE logical change (feature, bugfix, refactor, chore, test, docs).
+- Hunks from the SAME file CAN go into different commits when they are unrelated changes.
+- Order commits so dependencies come first (e.g. a new utility before the feature that uses it).
+- Use conventional commit format for the subject: type(scope): short imperative description.
+- Match the style of the recent commit log when one is provided.
+- If all changes are genuinely one concern, return a single commit.
+- The hunks are listed with numeric IDs. In "hunks", reference each hunk by its numeric ID — NEVER write file paths or hunk names.
+- Each hunk ID MUST appear in EXACTLY ONE group.
+- Entries marked "(whole file)" have no splittable text diff; assign them by their numeric ID like any other entry.
+- Always include a "reasoning" field explaining why these hunks belong together (one short sentence).
+"""
+
+SYSTEM_PROMPT_SCHEMA_HUNKS = """
+Respond with a single JSON object matching this schema, and nothing else (no markdown fences, no commentary). "hunks" holds the numeric IDs of the staged hunks in that commit:
+
+{
+  "commits": [
+    {
+      "message": "feat(api): add license validation endpoint",
+      "hunks": [1, 3],
+      "body": "",
+      "reasoning": "These hunks together implement the license check feature."
+    }
+  ]
+}
+"""
+
+
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -569,6 +850,29 @@ RESPONSE_SCHEMA = {
 }
 
 
+RESPONSE_SCHEMA_HUNKS = {
+    "type": "object",
+    "properties": {
+        "commits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string"},
+                    "hunks": {"type": "array", "items": {"type": "integer"}},
+                    "body": {"type": "string"},
+                    "reasoning": {"type": "string"},
+                },
+                "required": ["message", "hunks", "body", "reasoning"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["commits"],
+    "additionalProperties": False,
+}
+
+
 def build_system_prompt(verbose: bool) -> str:
     return (
         SYSTEM_PROMPT_BASE
@@ -577,13 +881,15 @@ def build_system_prompt(verbose: bool) -> str:
     )
 
 
-def build_user_message(
-    diff: str,
-    files: list[str],
-    recent_log: str,
-    conventions: str,
-    context: str = "",
-) -> str:
+def build_hunk_system_prompt(verbose: bool) -> str:
+    return (
+        SYSTEM_PROMPT_BASE_HUNKS
+        + (SYSTEM_PROMPT_VERBOSE if verbose else SYSTEM_PROMPT_TERSE)
+        + SYSTEM_PROMPT_SCHEMA_HUNKS
+    )
+
+
+def _prompt_preamble(recent_log: str, conventions: str, context: str) -> list[str]:
     parts: list[str] = []
     if context.strip():
         parts.append(
@@ -601,9 +907,69 @@ def build_user_message(
         parts.append(f"## Recent commit style\n{recent_log.strip()}")
     if conventions.strip():
         parts.append(f"## Project conventions\n{conventions.strip()}")
+    return parts
+
+
+def build_user_message(
+    diff: str,
+    files: list[str],
+    recent_log: str,
+    conventions: str,
+    context: str = "",
+) -> str:
+    parts = _prompt_preamble(recent_log, conventions, context)
     numbered = "\n".join(f"{i}. {f}" for i, f in enumerate(files, 1))
     parts.append("## Staged files (reference by numeric ID)\n" + numbered)
     parts.append(f"## Full diff\n{diff}")
+    return "\n\n".join(parts)
+
+
+def format_hunks_for_prompt(
+    index: HunkIndex,
+    max_bytes: int = MAX_DIFF_BYTES,
+    head_tail: int = DIFF_HEAD_TAIL_LINES,
+) -> str:
+    """Render the unit list with inline diff content, numbered for the model.
+
+    When the assembled listing exceeds max_bytes, each oversized hunk body
+    is head/tail truncated and pathologically long lines are clipped —
+    same strategy as truncate_diff for file-level mode. Truncation only
+    affects what the model sees; patches are always reassembled from the
+    verbatim hunks.
+    """
+
+    def block(i: int, unit: str, shrink: bool) -> str:
+        h = index.hunks.get(unit)
+        if h is None:
+            return f"{i}. {unit} (whole file — no splittable text diff)"
+        body = [h.header, *h.lines]
+        if shrink:
+            if len(body) > 2 * head_tail + 5:
+                omitted = len(body) - 2 * head_tail
+                body = (
+                    body[:head_tail]
+                    + [f"[... {omitted} lines truncated ...]"]
+                    + body[-head_tail:]
+                )
+            body = [_clip_line(l) for l in body]
+        return f"{i}. {unit}\n" + "\n".join(body)
+
+    text = "\n\n".join(block(i, u, False) for i, u in enumerate(index.units, 1))
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    return "\n\n".join(block(i, u, True) for i, u in enumerate(index.units, 1))
+
+
+def build_hunk_user_message(
+    index: HunkIndex,
+    recent_log: str,
+    conventions: str,
+    context: str = "",
+) -> str:
+    parts = _prompt_preamble(recent_log, conventions, context)
+    parts.append(
+        "## Staged hunks (reference by numeric ID)\n" + format_hunks_for_prompt(index)
+    )
     return "\n\n".join(parts)
 
 
@@ -657,14 +1023,15 @@ def _items_to_groups(items: list[dict]) -> list[CommitGroup]:
 
 
 def _request_completion(
-    config: Config, system: str, user: str, files: list[str]
+    config: Config, system: str, user: str, files: list[str], ref_key: str = "files"
 ) -> tuple[list[dict], Usage]:
     """Call an OpenAI-compatible /chat/completions endpoint with one parse retry.
 
-    The model returns numeric file IDs; they are resolved to real staged
-    paths here (see _resolve_file_ref), so returned items always carry
-    verbatim staged paths. Unresolvable references count as a parse failure
-    and trigger the same single corrective retry as malformed JSON.
+    The model returns numeric IDs; they are resolved against the `files`
+    list here (see _resolve_file_ref), so returned items always carry
+    verbatim staged paths — or hunk unit IDs when ref_key is "hunks".
+    Unresolvable references count as a parse failure and trigger the same
+    single corrective retry as malformed JSON.
     """
     headers = {
         "Authorization": f"Bearer {config.api_key}",
@@ -685,7 +1052,7 @@ def _request_completion(
             "json_schema": {
                 "name": "commits",
                 "strict": True,
-                "schema": RESPONSE_SCHEMA,
+                "schema": RESPONSE_SCHEMA_HUNKS if ref_key == "hunks" else RESPONSE_SCHEMA,
             },
         },
     }
@@ -724,12 +1091,23 @@ def _request_completion(
             parsed = json.loads(cleaned)
             items = [dict(item) for item in parsed["commits"]]
             for item in items:
-                item["files"] = [_resolve_file_ref(r, files) for r in item["files"]]
+                item[ref_key] = [_resolve_file_ref(r, files) for r in item[ref_key]]
             usage = _extract_usage(data, model=config.model)
             return items, usage
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             last_error = str(e)
             if attempt == 0:
+                if ref_key == "hunks":
+                    ref_hint = (
+                        "In \"hunks\", reference each hunk by its numeric ID from "
+                        "the staged hunk list; do not write file paths or hunk "
+                        "names."
+                    )
+                else:
+                    ref_hint = (
+                        "In \"files\", reference each staged file by its numeric "
+                        "ID from the staged file list; do not write file paths."
+                    )
                 # Append the bad assistant turn and ask for a clean retry.
                 messages.append({"role": "assistant", "content": text})
                 messages.append({
@@ -737,9 +1115,7 @@ def _request_completion(
                     "content": (
                         f"Your previous response was invalid: {last_error}. "
                         "Respond with ONLY the JSON object matching the schema — no "
-                        "markdown fences, no commentary. In \"files\", reference each "
-                        "staged file by its numeric ID from the staged file list; do "
-                        "not write file paths."
+                        f"markdown fences, no commentary. {ref_hint}"
                     ),
                 })
                 payload = {**payload, "messages": messages}
@@ -817,6 +1193,45 @@ def request_grouping(
     return _items_to_groups(items), usage
 
 
+def derive_group_files(groups: list[CommitGroup], index: HunkIndex) -> None:
+    """Fill each group's `files` from its hunk units (order-preserving unique)."""
+    for g in groups:
+        files: list[str] = []
+        for u in g.hunks:
+            h = index.hunks.get(u)
+            f = h.file if h else u
+            if f not in files:
+                files.append(f)
+        g.files = files
+
+
+def request_hunk_grouping(
+    config: Config,
+    index: HunkIndex,
+    recent_log: str,
+) -> tuple[list[CommitGroup], Usage]:
+    system = build_hunk_system_prompt(config.verbose_messages)
+    user = build_hunk_user_message(
+        index, recent_log, config.conventions, config.context
+    )
+    items, usage = _request_completion(
+        config, system, user, index.units, ref_key="hunks"
+    )
+    groups: list[CommitGroup] = []
+    for item in items:
+        groups.append(
+            CommitGroup(
+                message=str(item["message"]).strip(),
+                files=[],
+                body=str(item.get("body", "")).strip(),
+                reasoning=str(item.get("reasoning", "")).strip(),
+                hunks=[str(u) for u in item["hunks"]],
+            )
+        )
+    derive_group_files(groups, index)
+    return groups, usage
+
+
 # ======================================================================
 # Validation
 # ======================================================================
@@ -845,12 +1260,50 @@ def validate_groups(groups: list[CommitGroup], staged: list[str]) -> list[str]:
     return errors
 
 
+def validate_hunk_groups(groups: list[CommitGroup], units: list[str]) -> list[str]:
+    """Hunk-mode counterpart of validate_groups: every unit in exactly one commit."""
+    errors: list[str] = []
+    unit_set = set(units)
+    seen: dict[str, int] = {}
+    for i, g in enumerate(groups, 1):
+        if not g.message.strip():
+            errors.append(f"Commit {i}: empty message")
+        if not g.hunks:
+            errors.append(f"Commit {i}: no hunks")
+        for u in g.hunks:
+            if u not in unit_set:
+                errors.append(f"Commit {i}: '{u}' is not in the staged hunk list")
+            if u in seen:
+                errors.append(f"Hunk '{u}' appears in commits {seen[u]} and {i}")
+            else:
+                seen[u] = i
+    unassigned = sorted(unit_set - set(seen.keys()))
+    if unassigned:
+        errors.append("Hunks not in any commit: " + ", ".join(unassigned))
+    return errors
+
+
 # ======================================================================
 # Renderer + interactive prompt
 # ======================================================================
 
 
-def render_plan(groups: list[CommitGroup], verbose: bool, model: str = "") -> None:
+def _hunk_display_line(unit: str, index: HunkIndex) -> str:
+    h = index.hunks.get(unit)
+    if h is None:
+        return f"{unit} (whole file)"
+    header = h.header
+    if len(header) > 60:
+        header = header[:57] + "..."
+    return f"{unit}  {header}"
+
+
+def render_plan(
+    groups: list[CommitGroup],
+    verbose: bool,
+    model: str = "",
+    index: HunkIndex | None = None,
+) -> None:
     n = len(groups)
     suffix = "" if n == 1 else "s"
     who = model_display_name(model) if model else "model"
@@ -867,8 +1320,12 @@ def render_plan(groups: list[CommitGroup], verbose: bool, model: str = "") -> No
             print()
             print(wrapped)
             print()
-        for f in g.files:
-            print(f"     - {f}")
+        if index is not None and g.hunks:
+            for u in g.hunks:
+                print(f"     - {_hunk_display_line(u, index)}")
+        else:
+            for f in g.files:
+                print(f"     - {f}")
         print()
 
 
@@ -911,20 +1368,25 @@ def toml_str(s: str) -> str:
     return f'"{_toml_escape_basic(s)}"'
 
 
-def groups_to_toml(groups: list[CommitGroup]) -> str:
+def groups_to_toml(groups: list[CommitGroup], index: HunkIndex | None = None) -> str:
     lines = [
         "# Edit the commit plan below and save to apply.",
         "# Each [[commit]] block becomes one git commit, in order.",
         "# Reorder, edit, or delete blocks as needed.",
-        "",
     ]
+    if index is not None:
+        lines.append('# "hunks" entries reference the staged hunks:')
+        for u in index.units:
+            lines.append(f"#   {_hunk_display_line(u, index)}")
+    lines.append("")
     for g in groups:
         lines.append("[[commit]]")
         lines.append(f"message = {toml_str(g.message)}")
         lines.append(f"body = {toml_str(g.body)}")
-        lines.append("files = [")
-        for f in g.files:
-            lines.append(f"    {toml_str(f)},")
+        key, values = ("hunks", g.hunks) if index is not None else ("files", g.files)
+        lines.append(f"{key} = [")
+        for v in values:
+            lines.append(f"    {toml_str(v)},")
         lines.append("]")
         lines.append(f"reasoning = {toml_str(g.reasoning)}")
         lines.append("")
@@ -940,23 +1402,28 @@ def parse_toml_plan(text: str) -> list[CommitGroup]:
     for idx, item in enumerate(commits, 1):
         if not isinstance(item, dict):
             raise ValueError(f"commit {idx}: not a table")
-        if "message" not in item or "files" not in item:
-            raise ValueError(f"commit {idx}: missing 'message' or 'files'")
+        if "message" not in item or ("files" not in item and "hunks" not in item):
+            raise ValueError(f"commit {idx}: missing 'message' or 'files'/'hunks'")
         groups.append(
             CommitGroup(
                 message=str(item["message"]).strip(),
-                files=[str(f) for f in item["files"]],
+                files=[str(f) for f in item.get("files", [])],
                 body=str(item.get("body", "")).strip(),
                 reasoning=str(item.get("reasoning", "")).strip(),
+                hunks=[str(h) for h in item.get("hunks", [])],
             )
         )
     return groups
 
 
-def edit_plan(groups: list[CommitGroup], staged: list[str]) -> list[CommitGroup] | None:
+def edit_plan(
+    groups: list[CommitGroup],
+    staged: list[str],
+    index: HunkIndex | None = None,
+) -> list[CommitGroup] | None:
     """Open the plan in $EDITOR, validate, return updated groups or None on abort."""
     editor_cmd = os.environ.get("EDITOR", "vi")
-    text = groups_to_toml(groups)
+    text = groups_to_toml(groups, index)
     for attempt in range(2):
         with tempfile.NamedTemporaryFile("w", suffix=".smart-commit.toml", delete=False) as f:
             f.write(text)
@@ -989,7 +1456,10 @@ def edit_plan(groups: list[CommitGroup], staged: list[str]) -> list[CommitGroup]
                 continue
             return None
 
-        errors = validate_groups(new_groups, staged)
+        if index is not None:
+            errors = validate_hunk_groups(new_groups, index.units)
+        else:
+            errors = validate_groups(new_groups, staged)
         if errors:
             print("  validation errors:", file=sys.stderr)
             for err in errors:
@@ -998,6 +1468,8 @@ def edit_plan(groups: list[CommitGroup], staged: list[str]) -> list[CommitGroup]
                 text = edited
                 continue
             return None
+        if index is not None:
+            derive_group_files(new_groups, index)
         return new_groups
     return None
 
@@ -1014,6 +1486,27 @@ def build_commit_message(group: CommitGroup, config: Config) -> str:
     if config.trailers:
         sections.append("\n".join(config.trailers))
     return "\n\n".join(sections)
+
+
+def _commit_group(group: CommitGroup, config: Config) -> None:
+    """Commit the current index with the group's assembled message."""
+    message = build_commit_message(group, config)
+    if "\n" in message:
+        tmp = tempfile.NamedTemporaryFile(
+            "w", suffix=".smart-commit-msg", delete=False
+        )
+        try:
+            tmp.write(message)
+            tmp.flush()
+            tmp.close()
+            git_commit_with_file(tmp.name)
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+    else:
+        git_commit_with_message(message)
 
 
 def execute_plan(
@@ -1036,23 +1529,7 @@ def execute_plan(
                     paths_to_stage.append(old)
             git_add_all(paths_to_stage)
 
-            message = build_commit_message(group, config)
-            if "\n" in message:
-                tmp = tempfile.NamedTemporaryFile(
-                    "w", suffix=".smart-commit-msg", delete=False
-                )
-                try:
-                    tmp.write(message)
-                    tmp.flush()
-                    tmp.close()
-                    git_commit_with_file(tmp.name)
-                finally:
-                    try:
-                        os.unlink(tmp.name)
-                    except OSError:
-                        pass
-            else:
-                git_commit_with_message(message)
+            _commit_group(group, config)
             made += 1
             committed_paths.update(group.files)
             for old, new in rename_pairs.items():
@@ -1074,6 +1551,158 @@ def execute_plan(
             return made, total
 
     return made, total
+
+
+def execute_hunk_plan(
+    groups: list[CommitGroup],
+    all_staged: list[str],
+    rename_pairs: dict[str, str],
+    config: Config,
+    index: HunkIndex,
+) -> tuple[int, int]:
+    """Run the commit plan at hunk granularity. Return (commits_made, total).
+
+    Each group is staged by resetting the index and re-applying just that
+    group's hunks with `git apply --cached` (patches are reconstructed
+    against the working tree content, which never changes during the run,
+    so git can locate hunks even after earlier commits shift offsets).
+    When a file's hunks don't apply cleanly, the whole file falls back to
+    file-level staging in whichever remaining group holds the majority of
+    its hunks; a group left with nothing to commit is skipped and dropped
+    from the reported total.
+    """
+    total = len(groups)
+    made = 0
+    skipped = 0
+    consumed: set[str] = set()  # unit IDs that reached a commit
+    fallen_back: set[str] = set()  # files switched to file-level staging
+    scheduled_fallback: dict[int, list[str]] = {}  # group number -> files to whole-stage
+
+    def unit_file(u: str) -> str:
+        h = index.hunks.get(u)
+        return h.file if h else u
+
+    # file -> {group number -> hunk count}, for majority fallback targeting
+    file_group_counts: dict[str, dict[int, int]] = {}
+    for gi, g in enumerate(groups, 1):
+        for u in g.hunks:
+            if u in index.hunks:
+                counts = file_group_counts.setdefault(unit_file(u), {})
+                counts[gi] = counts.get(gi, 0) + 1
+
+    for i, group in enumerate(groups, 1):
+        try:
+            git_reset_index()
+            whole_staged: list[str] = []  # files staged file-level this round
+            deferred: set[str] = set()  # files pushed to a later group this round
+
+            add_paths = [u for u in group.hunks if u not in index.hunks]
+            add_paths.extend(scheduled_fallback.pop(i, []))
+            whole_staged.extend(add_paths)
+            for old, new in rename_pairs.items():
+                if new in add_paths:
+                    add_paths.append(old)
+            git_add_all(add_paths)
+
+            by_file: dict[str, list[Hunk]] = {}
+            for u in group.hunks:
+                h = index.hunks.get(u)
+                if h is not None and h.file not in fallen_back:
+                    by_file.setdefault(h.file, []).append(h)
+            for path, file_hunks in by_file.items():
+                patch = build_file_patch(index.headers[path], file_hunks)
+                try:
+                    git_apply_cached(patch)
+                except GitError as e:
+                    remaining = {
+                        gi: c
+                        for gi, c in file_group_counts[path].items()
+                        if gi >= i
+                    }
+                    target = max(remaining.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+                    fallen_back.add(path)
+                    if target == i:
+                        git_add_all([path])
+                        whole_staged.append(path)
+                        print(
+                            f"  ⚠ hunks for {path} did not apply cleanly; "
+                            f"staging the whole file in this commit ({e})",
+                            file=sys.stderr,
+                        )
+                    else:
+                        deferred.add(path)
+                        scheduled_fallback.setdefault(target, []).append(path)
+                        print(
+                            f"  ⚠ hunks for {path} did not apply cleanly; "
+                            f"staging the whole file in commit {target} instead ({e})",
+                            file=sys.stderr,
+                        )
+
+            if run_git(["diff", "--cached", "--quiet"], check=False).returncode == 0:
+                skipped += 1
+                print(
+                    f"  - ({i}/{total}) {group.message}: nothing left to commit "
+                    "(consolidated by file-level fallback)"
+                )
+                continue
+
+            _commit_group(group, config)
+            made += 1
+            for u in group.hunks:
+                if unit_file(u) not in deferred:
+                    consumed.add(u)
+            for path in whole_staged:
+                # A whole-file stage commits every remaining change for that
+                # file, wherever its hunks were assigned.
+                for g2 in groups:
+                    for u in g2.hunks:
+                        if unit_file(u) == path:
+                            consumed.add(u)
+            print(f"  ✓ ({i}/{total}) {group.message}")
+        except GitError as e:
+            print(f"  ✗ ({i}/{total}) {group.message}: {e}", file=sys.stderr)
+            # Re-stage every file that still has uncommitted units (whole-file
+            # best effort, matching file-level mode).
+            unconsumed_files = {
+                unit_file(u) for g2 in groups for u in g2.hunks if u not in consumed
+            }
+            remaining_paths = [p for p in all_staged if p in unconsumed_files]
+            for old, new in rename_pairs.items():
+                if new in remaining_paths and old not in remaining_paths:
+                    remaining_paths.append(old)
+            try:
+                git_reset_index()
+                git_add_all(remaining_paths)
+            except GitError as e2:
+                print(f"  also failed to re-stage remaining files: {e2}", file=sys.stderr)
+            return made, total
+
+    leftover = [u for g in groups for u in g.hunks if u not in consumed]
+    if leftover:
+        # Defensive: restore never-committed changes to the index so nothing
+        # is silently dropped. Shouldn't happen when every unit is assigned.
+        by_file = {}
+        for u in leftover:
+            by_file.setdefault(unit_file(u), []).append(u)
+        for path, units in by_file.items():
+            file_hunks = [index.hunks[u] for u in units if u in index.hunks]
+            try:
+                if file_hunks and len(file_hunks) == len(units):
+                    git_apply_cached(build_file_patch(index.headers[path], file_hunks))
+                else:
+                    git_add_all([path])
+            except GitError:
+                try:
+                    git_add_all([path])
+                except GitError:
+                    pass
+        print(
+            "  ⚠ re-staged changes that were never committed: "
+            + ", ".join(sorted(by_file)),
+            file=sys.stderr,
+        )
+
+    return made, total - skipped
 
 
 # ======================================================================
@@ -1114,6 +1743,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--auto",
         action="store_true",
         help="Skip the prompt and execute all commits (also: SMART_COMMIT_AUTO=1).",
+    )
+    parser.add_argument(
+        "-p",
+        "--split-hunks",
+        action="store_true",
+        help=(
+            "Split at hunk level: individual diff hunks within a file can be "
+            "assigned to different commits (also: split_hunks = true in config)."
+        ),
     )
     verbose = parser.add_mutually_exclusive_group()
     verbose.add_argument(
@@ -1360,17 +1998,30 @@ def main(argv: list[str] | None = None) -> int:
 
     n = len(staged)
     suffix = "" if n == 1 else "s"
-    print(f"Analyzing {n} staged file{suffix} using {config.model}...")
+    index: HunkIndex | None = None
+    if config.split_hunks:
+        index = build_hunk_index(staged, rename_pairs, git_staged_diff())
+        nh = len(index.hunks)
+        hunk_suffix = "" if nh == 1 else "s"
+        print(
+            f"Analyzing {n} staged file{suffix} ({nh} hunk{hunk_suffix}) "
+            f"using {config.model}..."
+        )
+    else:
+        print(f"Analyzing {n} staged file{suffix} using {config.model}...")
     if config.context:
         print(f'Context: "{config.context}"')
     print()
 
-    diff = truncate_diff(git_staged_diff())
     recent_log = git_recent_log()
 
     try:
         with Spinner(f"Thinking ({model_display_name(config.model)})"):
-            groups, usage = request_grouping(config, diff, staged, recent_log)
+            if index is not None:
+                groups, usage = request_hunk_grouping(config, index, recent_log)
+            else:
+                diff = truncate_diff(git_staged_diff())
+                groups, usage = request_grouping(config, diff, staged, recent_log)
     except APICallError as e:
         print(f"error: API call failed: {e}", file=sys.stderr)
         return EXIT_API_ERROR
@@ -1378,7 +2029,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: unexpected response shape from API: {e}", file=sys.stderr)
         return EXIT_API_ERROR
 
-    errors = validate_groups(groups, staged)
+    if index is not None:
+        errors = validate_hunk_groups(groups, index.units)
+    else:
+        errors = validate_groups(groups, staged)
     if errors:
         print(f"Validation errors in {model_display_name(config.model)}'s plan:", file=sys.stderr)
         for err in errors:
@@ -1393,12 +2047,12 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_VALIDATION_ERROR
         if not choice.startswith("e"):
             return EXIT_VALIDATION_ERROR
-        fixed = edit_plan(groups, staged)
+        fixed = edit_plan(groups, staged, index)
         if fixed is None:
             return EXIT_VALIDATION_ERROR
         groups = fixed
 
-    render_plan(groups, config.verbose_messages, config.model)
+    render_plan(groups, config.verbose_messages, config.model, index)
     print(format_usage_line(usage))
     print()
 
@@ -1415,14 +2069,17 @@ def main(argv: list[str] | None = None) -> int:
                 print("Aborted. Files remain staged.")
                 return EXIT_OK
             if action == "e":
-                edited = edit_plan(groups, staged)
+                edited = edit_plan(groups, staged, index)
                 if edited is not None:
                     groups = edited
                     print()
-                    render_plan(groups, config.verbose_messages, config.model)
+                    render_plan(groups, config.verbose_messages, config.model, index)
 
     print()
-    made, total = execute_plan(groups, staged, rename_pairs, config)
+    if index is not None:
+        made, total = execute_hunk_plan(groups, staged, rename_pairs, config, index)
+    else:
+        made, total = execute_plan(groups, staged, rename_pairs, config)
     print()
     if made == total:
         print(f"✓ Committed {made}/{total}")
