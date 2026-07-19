@@ -1685,3 +1685,533 @@ def test_usage_line_appears_in_output(tmp_git_repo, sc, monkeypatch, capsys):
     assert rc == sc.EXIT_OK
     out = capsys.readouterr().out
     assert "(~4.2k in · 890 out · $0.003)" in out
+
+
+# ----------------------------------------------------------------------
+# Hunk-level splitting (--split-hunks / -p)
+# ----------------------------------------------------------------------
+
+
+def _stage_multi_hunk_file(repo, name="app.py", n=40, edits=(3, 36)):
+    """Commit a baseline file, then stage edits far enough apart to form
+    one hunk per edit position."""
+    base = "".join(f"line{i}\n" for i in range(1, n + 1))
+    (repo / name).write_text(base)
+    subprocess.run(["git", "add", name], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", f"add {name}"], cwd=repo, check=True
+    )
+    lines = base.splitlines()
+    for pos in edits:
+        lines[pos - 1] = f"line{pos} EDITED"
+    (repo / name).write_text("\n".join(lines) + "\n")
+    subprocess.run(["git", "add", name], cwd=repo, check=True)
+
+
+def _show_file(repo, ref, name):
+    return subprocess.run(
+        ["git", "show", f"{ref}:{name}"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _patch_hunk_grouping(monkeypatch, sc, groups, usage=None):
+    if usage is None:
+        usage = sc.Usage(input_tokens=1234, output_tokens=567, cost_usd=0.0042)
+
+    def fake(config, index, recent_log):
+        return list(groups), usage
+
+    monkeypatch.setattr(sc, "request_hunk_grouping", fake)
+
+
+# --- diff parsing ---
+
+
+def test_parse_staged_hunks_multi_file(tmp_git_repo, sc):
+    _stage_multi_hunk_file(tmp_git_repo, "app.py")
+    stage_files(tmp_git_repo, {"new.py": "print('hi')\n"})
+
+    patches = sc.parse_staged_hunks(sc.git_staged_diff())
+    by_path = {p.path: p for p in patches}
+    assert set(by_path) == {"app.py", "new.py"}
+    app = by_path["app.py"]
+    assert len(app.hunks) == 2
+    assert app.header_lines[0].startswith("diff --git a/app.py b/app.py")
+    assert all(h.header.startswith("@@ -") for h in app.hunks)
+    assert app.hunks[0].hunk_id == "app.py#1"
+    assert app.hunks[1].hunk_id == "app.py#2"
+    assert any("EDITED" in l for l in app.hunks[0].lines)
+    # New file: single hunk with the added content.
+    new = by_path["new.py"]
+    assert len(new.hunks) == 1
+    assert any("print('hi')" in l for l in new.hunks[0].lines)
+
+
+def test_build_hunk_index_binary_and_rename_are_whole_file(tmp_git_repo, sc):
+    # Commit the rename baseline first — committing later would sweep up
+    # the other staged files.
+    (tmp_git_repo / "old.py").write_text("keep\n")
+    subprocess.run(["git", "add", "old.py"], cwd=tmp_git_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "add old"], cwd=tmp_git_repo, check=True
+    )
+    _stage_multi_hunk_file(tmp_git_repo, "app.py")
+    stage_binary_file(tmp_git_repo, "icon.png")
+    subprocess.run(["git", "mv", "old.py", "renamed.py"], cwd=tmp_git_repo, check=True)
+
+    staged, renames = sc.git_staged_status()
+    index = sc.build_hunk_index(staged, renames, sc.git_staged_diff())
+
+    assert "app.py#1" in index.units and "app.py#2" in index.units
+    assert "icon.png" in index.units  # bare unit, no hunks
+    assert "renamed.py" in index.units
+    assert "icon.png" not in index.hunks
+    assert "renamed.py" not in index.hunks
+    assert set(index.headers) == {"app.py"}
+
+
+def test_hunk_patch_roundtrip_applies(tmp_git_repo, sc):
+    _stage_multi_hunk_file(tmp_git_repo, "app.py", edits=(3, 36))
+    staged, renames = sc.git_staged_status()
+    index = sc.build_hunk_index(staged, renames, sc.git_staged_diff())
+    assert index.units == ["app.py#1", "app.py#2"]
+
+    sc.git_reset_index()
+    patch = sc.build_file_patch(index.headers["app.py"], [index.hunks["app.py#1"]])
+    sc.git_apply_cached(patch)
+
+    staged_diff = sc.git_staged_diff()
+    assert "line3 EDITED" in staged_diff
+    assert "line36 EDITED" not in staged_diff
+
+
+# --- the core new behavior: one file split across two commits ---
+
+
+def test_split_file_across_two_commits(tmp_git_repo, sc, monkeypatch):
+    _stage_multi_hunk_file(tmp_git_repo, "app.py", edits=(3, 36))
+    groups = [
+        sc.CommitGroup(
+            message="feat: change a", files=["app.py"], hunks=["app.py#1"]
+        ),
+        sc.CommitGroup(
+            message="fix: change b", files=["app.py"], hunks=["app.py#2"]
+        ),
+    ]
+    _patch_hunk_grouping(monkeypatch, sc, groups)
+
+    rc = sc.main(["--split-hunks", "--auto"])
+    assert rc == sc.EXIT_OK
+
+    subjects = commit_log_subjects(tmp_git_repo)
+    assert subjects[:2] == ["fix: change b", "feat: change a"]
+    first = _show_file(tmp_git_repo, "HEAD^", "app.py")
+    assert "line3 EDITED" in first
+    assert "line36 EDITED" not in first
+    final = _show_file(tmp_git_repo, "HEAD", "app.py")
+    assert "line3 EDITED" in final and "line36 EDITED" in final
+    assert staged_files(tmp_git_repo) == []
+
+
+def test_split_survives_offset_drift(tmp_git_repo, sc, monkeypatch):
+    """Committing hunk 1 shifts hunk 2's line offsets; git apply must still
+    locate it by context when commit 2 is built."""
+    base = "".join(f"line{i}\n" for i in range(1, 41))
+    (tmp_git_repo / "app.py").write_text(base)
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_git_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=tmp_git_repo, check=True)
+    lines = base.splitlines()
+    lines[3:3] = [f"inserted{j}" for j in range(5)]  # hunk 1 grows the file
+    lines[lines.index("line36")] = "line36 EDITED"  # hunk 2, offsets now stale
+    (tmp_git_repo / "app.py").write_text("\n".join(lines) + "\n")
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_git_repo, check=True)
+
+    groups = [
+        sc.CommitGroup(message="feat: insert", files=["app.py"], hunks=["app.py#1"]),
+        sc.CommitGroup(message="fix: edit", files=["app.py"], hunks=["app.py#2"]),
+    ]
+    _patch_hunk_grouping(monkeypatch, sc, groups)
+
+    rc = sc.main(["-p", "--auto"])
+    assert rc == sc.EXIT_OK
+    first = _show_file(tmp_git_repo, "HEAD^", "app.py")
+    assert "inserted0" in first and "EDITED" not in first
+    head = _show_file(tmp_git_repo, "HEAD", "app.py")
+    assert "inserted0" in head and "line36 EDITED" in head
+    assert staged_files(tmp_git_repo) == []
+
+
+def test_split_hunks_mixed_with_whole_file_units(tmp_git_repo, sc, monkeypatch):
+    _stage_multi_hunk_file(tmp_git_repo, "app.py", edits=(3, 36))
+    stage_binary_file(tmp_git_repo, "icon.png")
+    groups = [
+        sc.CommitGroup(
+            message="feat: change a",
+            files=["app.py", "icon.png"],
+            hunks=["app.py#1", "icon.png"],
+        ),
+        sc.CommitGroup(
+            message="fix: change b", files=["app.py"], hunks=["app.py#2"]
+        ),
+    ]
+    _patch_hunk_grouping(monkeypatch, sc, groups)
+
+    rc = sc.main(["-p", "--auto"])
+    assert rc == sc.EXIT_OK
+    first_files = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD^"],
+        cwd=tmp_git_repo, check=True, capture_output=True, text=True,
+    ).stdout.split()
+    assert sorted(first_files) == ["app.py", "icon.png"]
+    assert staged_files(tmp_git_repo) == []
+
+
+# --- fallback when hunks don't apply ---
+
+
+def test_hunk_fallback_stages_whole_file_in_current_group(
+    tmp_git_repo, sc, monkeypatch, capsys
+):
+    _stage_multi_hunk_file(tmp_git_repo, "app.py", edits=(3, 36))
+    stage_files(tmp_git_repo, {"b.py": "x = 1\n"})
+    groups = [
+        sc.CommitGroup(
+            message="feat: a", files=["app.py", "b.py"], hunks=["app.py#1", "b.py#1"]
+        ),
+        sc.CommitGroup(message="fix: b", files=["app.py"], hunks=["app.py#2"]),
+    ]
+    _patch_hunk_grouping(monkeypatch, sc, groups)
+
+    orig_apply = sc.git_apply_cached
+
+    def flaky(patch):
+        if "a/app.py" in patch:
+            raise sc.GitError("git apply --cached: patch failed")
+        return orig_apply(patch)
+
+    monkeypatch.setattr(sc, "git_apply_cached", flaky)
+
+    rc = sc.main(["-p", "--auto"])
+    assert rc == sc.EXIT_OK  # commit 2 was consolidated away, not an error
+
+    # Tie between groups 1 and 2 -> earliest wins: whole app.py in commit 1.
+    subjects = commit_log_subjects(tmp_git_repo)
+    assert subjects[0] == "feat: a"
+    assert "fix: b" not in subjects
+    head = _show_file(tmp_git_repo, "HEAD", "app.py")
+    assert "line3 EDITED" in head and "line36 EDITED" in head
+    assert staged_files(tmp_git_repo) == []
+    err = capsys.readouterr().err
+    assert "did not apply cleanly" in err
+
+
+def test_hunk_fallback_defers_to_majority_group(tmp_git_repo, sc, monkeypatch, capsys):
+    _stage_multi_hunk_file(tmp_git_repo, "app.py", n=90, edits=(3, 45, 87))
+    stage_files(tmp_git_repo, {"c.py": "y = 2\n"})
+    groups = [
+        sc.CommitGroup(
+            message="feat: a", files=["app.py", "c.py"], hunks=["app.py#1", "c.py#1"]
+        ),
+        sc.CommitGroup(
+            message="fix: b", files=["app.py"], hunks=["app.py#2", "app.py#3"]
+        ),
+    ]
+    _patch_hunk_grouping(monkeypatch, sc, groups)
+
+    orig_apply = sc.git_apply_cached
+
+    def flaky(patch):
+        if "a/app.py" in patch:
+            raise sc.GitError("git apply --cached: patch failed")
+        return orig_apply(patch)
+
+    monkeypatch.setattr(sc, "git_apply_cached", flaky)
+
+    rc = sc.main(["-p", "--auto"])
+    assert rc == sc.EXIT_OK
+
+    subjects = commit_log_subjects(tmp_git_repo)
+    assert subjects[:2] == ["fix: b", "feat: a"]
+    # Majority of app.py's hunks live in group 2 -> whole file deferred there.
+    first = _show_file(tmp_git_repo, "HEAD^", "app.py")
+    assert "EDITED" not in first
+    head = _show_file(tmp_git_repo, "HEAD", "app.py")
+    assert head.count("EDITED") == 3
+    assert staged_files(tmp_git_repo) == []
+    err = capsys.readouterr().err
+    assert "staging the whole file in commit 2 instead" in err
+
+
+# --- flag interactions ---
+
+
+def test_split_hunks_dry_run_makes_no_commits(tmp_git_repo, sc, monkeypatch, capsys):
+    _stage_multi_hunk_file(tmp_git_repo, "app.py")
+    groups = [
+        sc.CommitGroup(message="feat: a", files=["app.py"], hunks=["app.py#1"]),
+        sc.CommitGroup(message="fix: b", files=["app.py"], hunks=["app.py#2"]),
+    ]
+    _patch_hunk_grouping(monkeypatch, sc, groups)
+    initial = len(commit_log_subjects(tmp_git_repo))
+
+    rc = sc.main(["-p", "--dry-run"])
+    assert rc == sc.EXIT_OK
+    assert len(commit_log_subjects(tmp_git_repo)) == initial
+    assert staged_files(tmp_git_repo) == ["app.py"]
+    out = capsys.readouterr().out
+    assert "app.py#1" in out and "app.py#2" in out  # plan shows hunk IDs
+    assert "(2 hunks)" in out
+
+
+def test_split_hunks_auto_skips_prompt(tmp_git_repo, sc, monkeypatch):
+    _stage_multi_hunk_file(tmp_git_repo, "app.py")
+    groups = [
+        sc.CommitGroup(
+            message="feat: a", files=["app.py"], hunks=["app.py#1", "app.py#2"]
+        ),
+    ]
+    _patch_hunk_grouping(monkeypatch, sc, groups)
+
+    def no_input(*_):
+        raise AssertionError("should not be prompted")
+
+    monkeypatch.setattr("builtins.input", no_input)
+    rc = sc.main(["-p", "--auto"])
+    assert rc == sc.EXIT_OK
+    assert "feat: a" in commit_log_subjects(tmp_git_repo)
+
+
+def test_split_hunks_verbose_writes_body(tmp_git_repo, sc, monkeypatch):
+    _stage_multi_hunk_file(tmp_git_repo, "app.py")
+    groups = [
+        sc.CommitGroup(
+            message="feat: a",
+            files=["app.py"],
+            hunks=["app.py#1", "app.py#2"],
+            body="Both edits belong to the same feature.",
+        ),
+    ]
+    _patch_hunk_grouping(monkeypatch, sc, groups)
+
+    rc = sc.main(["-p", "--verbose", "--auto"])
+    assert rc == sc.EXIT_OK
+    body = commit_body(tmp_git_repo)
+    assert body.startswith("feat: a\n\n")
+    assert "same feature" in body
+
+
+def test_no_flag_keeps_file_level_path(tmp_git_repo, sc, monkeypatch):
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py"])]
+    _patch_grouping(monkeypatch, sc, groups)
+
+    def boom(*_a, **_kw):
+        raise AssertionError("hunk path must not run without --split-hunks")
+
+    monkeypatch.setattr(sc, "request_hunk_grouping", boom)
+    monkeypatch.setattr(sc, "build_hunk_index", boom)
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    assert "feat: a" in commit_log_subjects(tmp_git_repo)
+
+
+def test_split_hunks_validation_failure_aborts(tmp_git_repo, sc, monkeypatch):
+    _stage_multi_hunk_file(tmp_git_repo, "app.py")
+    # app.py#2 unassigned -> validation error.
+    groups = [
+        sc.CommitGroup(message="feat: a", files=["app.py"], hunks=["app.py#1"]),
+    ]
+    _patch_hunk_grouping(monkeypatch, sc, groups)
+    initial = len(commit_log_subjects(tmp_git_repo))
+
+    rc = sc.main(["-p", "--auto"])
+    assert rc == sc.EXIT_VALIDATION_ERROR
+    assert len(commit_log_subjects(tmp_git_repo)) == initial
+    assert staged_files(tmp_git_repo) == ["app.py"]
+
+
+# --- validation ---
+
+
+def test_validate_hunk_groups_happy(sc):
+    groups = [
+        sc.CommitGroup(message="feat: x", files=[], hunks=["a.py#1", "b.py"]),
+        sc.CommitGroup(message="chore: y", files=[], hunks=["a.py#2"]),
+    ]
+    assert sc.validate_hunk_groups(groups, ["a.py#1", "a.py#2", "b.py"]) == []
+
+
+def test_validate_hunk_groups_duplicate(sc):
+    groups = [
+        sc.CommitGroup(message="feat: x", files=[], hunks=["a.py#1"]),
+        sc.CommitGroup(message="feat: y", files=[], hunks=["a.py#1"]),
+    ]
+    errors = sc.validate_hunk_groups(groups, ["a.py#1"])
+    assert any("appears in commits 1 and 2" in e for e in errors)
+
+
+def test_validate_hunk_groups_unknown_and_unassigned(sc):
+    groups = [sc.CommitGroup(message="feat: x", files=[], hunks=["ghost.py#9"])]
+    errors = sc.validate_hunk_groups(groups, ["a.py#1"])
+    assert any("'ghost.py#9' is not in the staged hunk list" in e for e in errors)
+    assert any("Hunks not in any commit: a.py#1" in e for e in errors)
+
+
+def test_validate_hunk_groups_no_hunks(sc):
+    groups = [sc.CommitGroup(message="feat: x", files=["a.py"], hunks=[])]
+    errors = sc.validate_hunk_groups(groups, [])
+    assert any("no hunks" in e for e in errors)
+
+
+# --- prompt + schema ---
+
+
+def _fake_index(sc):
+    h1 = sc.Hunk(
+        file="a.py", header="@@ -1,2 +1,3 @@", lines=[" x", "+y"],
+        hunk_id="a.py#1", seq=1,
+    )
+    h2 = sc.Hunk(
+        file="a.py", header="@@ -10,2 +11,2 @@", lines=["-old", "+new"],
+        hunk_id="a.py#2", seq=2,
+    )
+    return sc.HunkIndex(
+        units=["a.py#1", "a.py#2", "icon.png"],
+        hunks={"a.py#1": h1, "a.py#2": h2},
+        headers={"a.py": ["diff --git a/a.py b/a.py", "--- a/a.py", "+++ b/a.py"]},
+    )
+
+
+def test_build_hunk_user_message_contents(sc):
+    index = _fake_index(sc)
+    msg = sc.build_hunk_user_message(index, recent_log="", conventions="", context="")
+    assert "## Staged hunks (reference by numeric ID)" in msg
+    assert "1. a.py#1\n@@ -1,2 +1,3 @@" in msg
+    assert "+y" in msg
+    assert "3. icon.png (whole file" in msg
+
+
+def test_hunk_schema_uses_integer_hunks(sc):
+    items = sc.RESPONSE_SCHEMA_HUNKS["properties"]["commits"]["items"]
+    assert items["properties"]["hunks"]["items"] == {"type": "integer"}
+    assert "hunks" in items["required"]
+
+
+def test_hunk_system_prompt_allows_same_file_split(sc):
+    prompt = sc.build_hunk_system_prompt(verbose=False)
+    assert "SAME file CAN go into different commits" in prompt
+    assert '"hunks"' in prompt
+
+
+def test_format_hunks_for_prompt_truncates_when_oversized(sc):
+    big = sc.Hunk(
+        file="big.py", header="@@ -1,500 +1,500 @@",
+        lines=[f"+x{i}" for i in range(500)], hunk_id="big.py#1", seq=1,
+    )
+    index = sc.HunkIndex(
+        units=["big.py#1"], hunks={"big.py#1": big},
+        headers={"big.py": ["diff --git a/big.py b/big.py"]},
+    )
+    out = sc.format_hunks_for_prompt(index, max_bytes=100, head_tail=10)
+    assert "lines truncated" in out
+    assert out.startswith("1. big.py#1")
+
+
+def test_request_completion_resolves_hunk_ids(sc, monkeypatch):
+    calls = {"payloads": []}
+    _make_fake_client(sc, monkeypatch, [
+        '{"commits":[{"message":"feat: x","hunks":[2,1],"body":"","reasoning":"r"}]}',
+    ], calls)
+    cfg = sc.Config(model="m", api_key="k", base_url=sc.DEFAULT_API_BASE)
+    items, _usage = sc._request_completion(
+        cfg, "system", "user", ["a.py#1", "a.py#2"], ref_key="hunks"
+    )
+    assert items[0]["hunks"] == ["a.py#2", "a.py#1"]
+    schema = calls["payloads"][0]["response_format"]["json_schema"]["schema"]
+    assert schema == sc.RESPONSE_SCHEMA_HUNKS
+
+
+def test_request_completion_retries_on_bad_hunk_ref(sc, monkeypatch):
+    calls = {"payloads": []}
+    _make_fake_client(sc, monkeypatch, [
+        '{"commits":[{"message":"x","hunks":[5],"body":"","reasoning":"r"}]}',
+        '{"commits":[{"message":"x","hunks":[1],"body":"","reasoning":"r"}]}',
+    ], calls)
+    cfg = sc.Config(model="m", api_key="k", base_url=sc.DEFAULT_API_BASE)
+    items, _usage = sc._request_completion(
+        cfg, "system", "user", ["a.py#1"], ref_key="hunks"
+    )
+    assert len(calls["payloads"]) == 2
+    assert items[0]["hunks"] == ["a.py#1"]
+    retry_msg = calls["payloads"][1]["messages"][-1]["content"]
+    assert "numeric ID" in retry_msg and "hunk" in retry_msg
+
+
+# --- TOML edit mode ---
+
+
+def test_groups_to_toml_hunks_roundtrip(sc):
+    index = _fake_index(sc)
+    groups = [
+        sc.CommitGroup(
+            message="feat: x", files=["a.py"], hunks=["a.py#1", "a.py#2"],
+            body="", reasoning="r",
+        ),
+        sc.CommitGroup(
+            message="chore: icon", files=["icon.png"], hunks=["icon.png"],
+            body="", reasoning="r2",
+        ),
+    ]
+    text = sc.groups_to_toml(groups, index)
+    # Catalog of available hunks is in the header comments.
+    assert "#   a.py#1  @@ -1,2 +1,3 @@" in text
+    assert "#   icon.png (whole file)" in text
+    parsed = sc.parse_toml_plan(text)
+    assert parsed[0].hunks == ["a.py#1", "a.py#2"]
+    assert parsed[1].hunks == ["icon.png"]
+    assert sc.validate_hunk_groups(parsed, index.units) == []
+
+
+def test_parse_toml_plan_requires_files_or_hunks(sc):
+    with pytest.raises(ValueError):
+        sc.parse_toml_plan('[[commit]]\nmessage = "x"\n')
+    parsed = sc.parse_toml_plan('[[commit]]\nmessage = "x"\nhunks = ["a.py#1"]\n')
+    assert parsed[0].hunks == ["a.py#1"]
+    assert parsed[0].files == []
+
+
+def test_derive_group_files_from_hunks(sc):
+    index = _fake_index(sc)
+    groups = [
+        sc.CommitGroup(
+            message="m", files=[], hunks=["a.py#2", "icon.png", "a.py#1"]
+        )
+    ]
+    sc.derive_group_files(groups, index)
+    assert groups[0].files == ["a.py", "icon.png"]
+
+
+# --- config ---
+
+
+def test_split_hunks_cli_flag_parses(sc):
+    assert sc.parse_args(["-p"]).split_hunks is True
+    assert sc.parse_args(["--split-hunks"]).split_hunks is True
+    assert sc.parse_args([]).split_hunks is False
+
+
+def test_split_hunks_config_key(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
+    (tmp_path / sc.CONFIG_FILENAME).write_text("split_hunks = true\n")
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.split_hunks is True
+
+
+def test_split_hunks_defaults_off(sc, tmp_path, monkeypatch):
+    monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
+    cfg = sc.build_config(_ns(), tmp_path)
+    assert cfg.split_hunks is False
