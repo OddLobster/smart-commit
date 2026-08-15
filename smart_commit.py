@@ -1022,8 +1022,39 @@ def _items_to_groups(items: list[dict]) -> list[CommitGroup]:
     return groups
 
 
+def _uses_qwen37_flash_compat(config: Config) -> bool:
+    """Whether this request needs OpenRouter's Qwen 3.7 Flash compatibility mode."""
+    return (
+        config.base_url.rstrip("/") == DEFAULT_API_BASE
+        and config.model == "qwen/qwen3.7-flash"
+    )
+
+
+def _empty_content_error(data: dict) -> str:
+    """Summarize a successful API response that contains no assistant text."""
+    choice = data.get("choices", [{}])[0] or {}
+    message = choice.get("message") or {}
+    details = (data.get("usage") or {}).get("completion_tokens_details") or {}
+    parts = ["model returned no text content"]
+    for key in ("finish_reason", "native_finish_reason"):
+        if choice.get(key) is not None:
+            parts.append(f"{key}={choice[key]!r}")
+    if details.get("reasoning_tokens") is not None:
+        parts.append(f"reasoning_tokens={details['reasoning_tokens']}")
+    elif message.get("reasoning") or message.get("reasoning_details"):
+        parts.append("reasoning was present")
+    if data.get("error"):
+        parts.append(f"error={str(data['error'])[:200]}")
+    return "; ".join(parts)
+
+
 def _request_completion(
-    config: Config, system: str, user: str, files: list[str], ref_key: str = "files"
+    config: Config,
+    system: str,
+    user: str,
+    files: list[str],
+    ref_key: str = "files",
+    correction: tuple[str, str] | None = None,
 ) -> tuple[list[dict], Usage]:
     """Call an OpenAI-compatible /chat/completions endpoint with one parse retry.
 
@@ -1032,6 +1063,10 @@ def _request_completion(
     verbatim staged paths — or hunk unit IDs when ref_key is "hunks".
     Unresolvable references count as a parse failure and trigger the same
     single corrective retry as malformed JSON.
+
+    `correction` is a (prior_plan_json, complaint) pair. When given, the
+    conversation is seeded with the model's own earlier plan and a message
+    describing what was wrong with it, so it can return a fixed version.
     """
     headers = {
         "Authorization": f"Bearer {config.api_key}",
@@ -1043,25 +1078,38 @@ def _request_completion(
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    if correction is not None:
+        prior_plan, complaint = correction
+        messages.append({"role": "assistant", "content": prior_plan})
+        messages.append({"role": "user", "content": complaint})
+    schema = RESPONSE_SCHEMA_HUNKS if ref_key == "hunks" else RESPONSE_SCHEMA
+    response_format: dict = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "commits",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+    if _uses_qwen37_flash_compat(config):
+        # Qwen 3.7 Flash currently advertises JSON-object output but not strict
+        # JSON Schema on OpenRouter. It also reasons by default, which can use
+        # the entire completion budget and leave message.content as null.
+        response_format = {"type": "json_object"}
+
     payload = {
         "model": config.model,
         "messages": messages,
         "max_tokens": MAX_TOKENS,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "commits",
-                "strict": True,
-                "schema": RESPONSE_SCHEMA_HUNKS if ref_key == "hunks" else RESPONSE_SCHEMA,
-            },
-        },
+        "response_format": response_format,
     }
+    if _uses_qwen37_flash_compat(config):
+        payload["reasoning"] = {"enabled": False}
     # Note: OpenRouter's `usage: {include: true}` and OpenAI's `stream_options:
     # {include_usage: true}` are now deprecated/no-ops — usage is always returned.
 
     last_error: str | None = None
     last_text: str | None = None
-    last_data: dict | None = None
     for attempt in range(2):
         try:
             with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
@@ -1080,46 +1128,53 @@ def _request_completion(
         except httpx.HTTPError as e:
             raise APICallError(f"HTTP error talking to {config.base_url}: {e}") from e
 
-        last_data = data
         try:
-            text = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            text = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
             raise APICallError(f"Unexpected response shape from {config.base_url}: {e}") from e
-        last_text = text
-        cleaned = _strip_json_fences(text)
-        try:
-            parsed = json.loads(cleaned)
-            items = [dict(item) for item in parsed["commits"]]
-            for item in items:
-                item[ref_key] = [_resolve_file_ref(r, files) for r in item[ref_key]]
-            usage = _extract_usage(data, model=config.model)
-            return items, usage
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-            last_error = str(e)
-            if attempt == 0:
-                if ref_key == "hunks":
-                    ref_hint = (
-                        "In \"hunks\", reference each hunk by its numeric ID from "
-                        "the staged hunk list; do not write file paths or hunk "
-                        "names."
-                    )
-                else:
-                    ref_hint = (
-                        "In \"files\", reference each staged file by its numeric "
-                        "ID from the staged file list; do not write file paths."
-                    )
-                # Append the bad assistant turn and ask for a clean retry.
+        if not isinstance(text, str) or not text.strip():
+            last_text = None
+            last_error = _empty_content_error(data)
+        else:
+            last_text = text
+            cleaned = _strip_json_fences(text)
+            try:
+                parsed = json.loads(cleaned)
+                items = [dict(item) for item in parsed["commits"]]
+                for item in items:
+                    item[ref_key] = [_resolve_file_ref(r, files) for r in item[ref_key]]
+                usage = _extract_usage(data, model=config.model)
+                return items, usage
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+                last_error = str(e)
+
+        if attempt == 0:
+            if ref_key == "hunks":
+                ref_hint = (
+                    "In \"hunks\", reference each hunk by its numeric ID from "
+                    "the staged hunk list; do not write file paths or hunk "
+                    "names."
+                )
+            else:
+                ref_hint = (
+                    "In \"files\", reference each staged file by its numeric "
+                    "ID from the staged file list; do not write file paths."
+                )
+            # Preserve a malformed textual response for context. A null
+            # response cannot be sent back as assistant content.
+            if last_text is not None:
                 messages.append({"role": "assistant", "content": text})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"Your previous response was invalid: {last_error}. "
-                        "Respond with ONLY the JSON object matching the schema — no "
-                        f"markdown fences, no commentary. {ref_hint}"
-                    ),
-                })
-                payload = {**payload, "messages": messages}
-                continue
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Your previous response was invalid: {last_error}. "
+                    "Respond with ONLY the JSON object matching the schema — no "
+                    f"markdown fences, no commentary. {ref_hint}"
+                ),
+            })
+            payload = {**payload, "messages": messages}
+            continue
     snippet = (last_text or "")[:200].replace("\n", " ")
     raise APICallError(f"Could not parse JSON from model after retry ({last_error}): {snippet!r}")
 
@@ -1217,6 +1272,10 @@ def request_hunk_grouping(
     items, usage = _request_completion(
         config, system, user, index.units, ref_key="hunks"
     )
+    return _items_to_hunk_groups(items, index), usage
+
+
+def _items_to_hunk_groups(items: list[dict], index: HunkIndex) -> list[CommitGroup]:
     groups: list[CommitGroup] = []
     for item in items:
         groups.append(
@@ -1229,7 +1288,101 @@ def request_hunk_grouping(
             )
         )
     derive_group_files(groups, index)
-    return groups, usage
+    return groups
+
+
+# ======================================================================
+# Plan repair
+# ======================================================================
+
+
+def _sum_usage(a: Usage, b: Usage) -> Usage:
+    """Combine the usage of two calls. Cost is None unless both are priced."""
+    cost = (
+        None
+        if a.cost_usd is None or b.cost_usd is None
+        else a.cost_usd + b.cost_usd
+    )
+    return Usage(
+        input_tokens=a.input_tokens + b.input_tokens,
+        output_tokens=a.output_tokens + b.output_tokens,
+        cost_usd=cost,
+        estimated=a.estimated or b.estimated,
+    )
+
+
+def _plan_as_json(groups: list[CommitGroup], refs: list[str], ref_key: str) -> str:
+    """Re-serialize a parsed plan into the numeric-ID JSON the model emits.
+
+    Used as the assistant turn of a repair round so the model sees its own
+    plan in the shape it produced it. References that don't resolve against
+    `refs` are dropped — they are exactly what the errors complain about.
+    """
+    ids = {ref: i for i, ref in enumerate(refs, 1)}
+    commits = []
+    for g in groups:
+        members = g.hunks if ref_key == "hunks" else g.files
+        commits.append({
+            "message": g.message,
+            ref_key: [ids[m] for m in members if m in ids],
+            "body": g.body,
+            "reasoning": g.reasoning,
+        })
+    return json.dumps({"commits": commits}, indent=2)
+
+
+def _repair_user_message(errors: list[str], ref_key: str) -> str:
+    noun = "hunk" if ref_key == "hunks" else "file"
+    bullets = "\n".join(f"- {e}" for e in errors)
+    return (
+        f"Your plan is invalid:\n{bullets}\n\n"
+        f"Every staged {noun} ID must appear in EXACTLY ONE commit — no "
+        f"omissions, no duplicates. Low-signal entries still count: deletions, "
+        f"binary files and generated artifacts must be assigned too, grouped "
+        f"into a `chore:` commit when they don't belong with anything else. "
+        f"Return the corrected plan as ONLY the JSON object matching the schema."
+    )
+
+
+def request_grouping_repair(
+    config: Config,
+    diff: str,
+    files: list[str],
+    recent_log: str,
+    groups: list[CommitGroup],
+    errors: list[str],
+) -> tuple[list[CommitGroup], Usage]:
+    """Ask the model to fix a plan that failed validate_groups."""
+    system = build_system_prompt(config.verbose_messages)
+    user = build_user_message(diff, files, recent_log, config.conventions, config.context)
+    correction = (
+        _plan_as_json(groups, files, "files"),
+        _repair_user_message(errors, "files"),
+    )
+    items, usage = _request_completion(config, system, user, files, correction=correction)
+    return _items_to_groups(items), usage
+
+
+def request_hunk_grouping_repair(
+    config: Config,
+    index: HunkIndex,
+    recent_log: str,
+    groups: list[CommitGroup],
+    errors: list[str],
+) -> tuple[list[CommitGroup], Usage]:
+    """Hunk-mode counterpart of request_grouping_repair."""
+    system = build_hunk_system_prompt(config.verbose_messages)
+    user = build_hunk_user_message(
+        index, recent_log, config.conventions, config.context
+    )
+    correction = (
+        _plan_as_json(groups, index.units, "hunks"),
+        _repair_user_message(errors, "hunks"),
+    )
+    items, usage = _request_completion(
+        config, system, user, index.units, ref_key="hunks", correction=correction
+    )
+    return _items_to_hunk_groups(items, index), usage
 
 
 # ======================================================================
@@ -2029,14 +2182,43 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: unexpected response shape from API: {e}", file=sys.stderr)
         return EXIT_API_ERROR
 
-    if index is not None:
-        errors = validate_hunk_groups(groups, index.units)
-    else:
-        errors = validate_groups(groups, staged)
+    def _validate(gs: list[CommitGroup]) -> list[str]:
+        if index is not None:
+            return validate_hunk_groups(gs, index.units)
+        return validate_groups(gs, staged)
+
+    errors = _validate(groups)
     if errors:
         print(f"Validation errors in {model_display_name(config.model)}'s plan:", file=sys.stderr)
         for err in errors:
             print(f"  - {err}", file=sys.stderr)
+        # One corrective round: hand the model its own plan plus the errors.
+        # Mirrors the parse retry in _request_completion — cheap models tend
+        # to drop low-signal entries (binary files, deletions) and usually
+        # fix it when told exactly what is missing.
+        print("Asking the model to fix it...", file=sys.stderr)
+        try:
+            with Spinner(f"Repairing ({model_display_name(config.model)})"):
+                if index is not None:
+                    repaired, repair_usage = request_hunk_grouping_repair(
+                        config, index, recent_log, groups, errors
+                    )
+                else:
+                    repaired, repair_usage = request_grouping_repair(
+                        config, diff, staged, recent_log, groups, errors
+                    )
+        except (APICallError, json.JSONDecodeError, KeyError, TypeError) as e:
+            print(f"  repair attempt failed: {e}", file=sys.stderr)
+        else:
+            usage = _sum_usage(usage, repair_usage)
+            if _validate(repaired):
+                print("  still invalid — keeping the original plan.", file=sys.stderr)
+            else:
+                groups, errors = repaired, []
+                print("  fixed.", file=sys.stderr)
+        print(file=sys.stderr)
+
+    if errors:
         if config.auto or config.dry_run:
             return EXIT_VALIDATION_ERROR
         print("\nOpen in editor to fix?")
