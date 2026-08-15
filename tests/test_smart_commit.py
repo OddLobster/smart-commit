@@ -174,7 +174,13 @@ def _patch_grouping(monkeypatch, sc, groups, usage=None):
     def fake(config, diff, files, recent_log):
         return list(groups), usage
 
+    def fake_repair(config, diff, files, recent_log, groups_in, errors):
+        # Default: the repair round can't fix it either, so validation
+        # failures still fall through to the Edit/Quit path.
+        return list(groups), usage
+
     monkeypatch.setattr(sc, "request_grouping", fake)
+    monkeypatch.setattr(sc, "request_grouping_repair", fake_repair)
 
 
 def test_happy_path_two_groups(tmp_git_repo, sc, monkeypatch, capsys):
@@ -660,6 +666,119 @@ def test_openrouter_retries_on_bad_json(sc, monkeypatch):
     items, _usage = sc._request_completion(cfg, "system", "user", ["b.py"])
     assert calls["n"] == 2
     assert items[0]["files"] == ["b.py"]
+
+
+def test_qwen37_flash_uses_compatible_request_options(sc, monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"commits":[{"message":"feat: x","files":[1],"body":"","reasoning":"r"}]}'
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            captured["payload"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+    cfg = sc.Config(
+        model="qwen/qwen3.7-flash",
+        api_key="or-test",
+        base_url=sc.DEFAULT_API_BASE,
+    )
+    items, _usage = sc._request_completion(cfg, "system", "user", ["a.py"])
+    assert items[0]["files"] == ["a.py"]
+    assert captured["payload"]["response_format"] == {"type": "json_object"}
+    assert captured["payload"]["reasoning"] == {"enabled": False}
+
+
+def test_null_content_retries_without_assistant_null_turn(sc, monkeypatch):
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    responses = [
+        {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "native_finish_reason": "max_tokens",
+                    "message": {"content": None, "reasoning": "thinking"},
+                }
+            ],
+            "usage": {"completion_tokens_details": {"reasoning_tokens": 4096}},
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"commits":[{"message":"feat: x","files":[1],"body":"","reasoning":"r"}]}'
+                    }
+                }
+            ]
+        },
+    ]
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            calls.append(json)
+            return FakeResponse(responses[len(calls) - 1])
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+    cfg = sc.Config(model="some/model", api_key="k", base_url=sc.DEFAULT_API_BASE)
+    items, _usage = sc._request_completion(cfg, "system", "user", ["a.py"])
+    assert items[0]["files"] == ["a.py"]
+    assert len(calls) == 2
+    retry_messages = calls[1]["messages"]
+    assert [m["role"] for m in retry_messages] == ["system", "user", "user"]
+    assert "finish_reason='length'" in retry_messages[-1]["content"]
+    assert "reasoning_tokens=4096" in retry_messages[-1]["content"]
+
+
+def test_persistent_null_content_raises_diagnostic_api_error(sc, monkeypatch):
+    calls = {"payloads": []}
+    _make_fake_client(sc, monkeypatch, [None], calls)
+    cfg = sc.Config(model="some/model", api_key="k", base_url=sc.DEFAULT_API_BASE)
+    with pytest.raises(sc.APICallError, match="model returned no text content"):
+        sc._request_completion(cfg, "system", "user", ["a.py"])
+    assert len(calls["payloads"]) == 2
 
 
 # ----------------------------------------------------------------------
@@ -1725,7 +1844,11 @@ def _patch_hunk_grouping(monkeypatch, sc, groups, usage=None):
     def fake(config, index, recent_log):
         return list(groups), usage
 
+    def fake_repair(config, index, recent_log, groups_in, errors):
+        return list(groups), usage
+
     monkeypatch.setattr(sc, "request_hunk_grouping", fake)
+    monkeypatch.setattr(sc, "request_hunk_grouping_repair", fake_repair)
 
 
 # --- diff parsing ---
@@ -2215,3 +2338,255 @@ def test_split_hunks_defaults_off(sc, tmp_path, monkeypatch):
     monkeypatch.setenv("SMART_COMMIT_API_KEY", "x")
     cfg = sc.build_config(_ns(), tmp_path)
     assert cfg.split_hunks is False
+
+
+# --- plan repair ---
+
+
+def test_sum_usage_adds_tokens_and_cost(sc):
+    a = sc.Usage(input_tokens=100, output_tokens=10, cost_usd=0.001)
+    b = sc.Usage(input_tokens=250, output_tokens=25, cost_usd=0.002)
+    total = sc._sum_usage(a, b)
+    assert total.input_tokens == 350
+    assert total.output_tokens == 35
+    assert total.cost_usd == pytest.approx(0.003)
+    assert total.estimated is False
+
+
+def test_sum_usage_unknown_cost_stays_unknown(sc):
+    a = sc.Usage(input_tokens=1, output_tokens=1, cost_usd=None)
+    b = sc.Usage(input_tokens=1, output_tokens=1, cost_usd=0.5)
+    assert sc._sum_usage(a, b).cost_usd is None
+
+
+def test_sum_usage_propagates_estimated_flag(sc):
+    a = sc.Usage(input_tokens=1, output_tokens=1, cost_usd=0.1, estimated=True)
+    b = sc.Usage(input_tokens=1, output_tokens=1, cost_usd=0.1, estimated=False)
+    assert sc._sum_usage(a, b).estimated is True
+
+
+def test_plan_as_json_uses_numeric_ids(sc):
+    groups = [
+        sc.CommitGroup(message="feat: a", files=["a.py", "c.py"], reasoning="r1"),
+        sc.CommitGroup(message="chore: b", files=["b.py"], body="why", reasoning="r2"),
+    ]
+    import json as _json
+
+    plan = _json.loads(sc._plan_as_json(groups, ["a.py", "b.py", "c.py"], "files"))
+    assert plan["commits"][0]["files"] == [1, 3]
+    assert plan["commits"][1]["files"] == [2]
+    assert plan["commits"][1]["body"] == "why"
+    assert plan["commits"][0]["message"] == "feat: a"
+
+
+def test_plan_as_json_drops_unresolvable_refs(sc):
+    groups = [sc.CommitGroup(message="feat: a", files=["a.py", "ghost.py"])]
+    import json as _json
+
+    plan = _json.loads(sc._plan_as_json(groups, ["a.py"], "files"))
+    assert plan["commits"][0]["files"] == [1]
+
+
+def test_repair_user_message_lists_errors(sc):
+    msg = sc._repair_user_message(["Files not in any commit: build/x.jar"], "files")
+    assert "build/x.jar" in msg
+    assert "EXACTLY ONE" in msg
+    assert "file ID" in msg
+
+
+def test_request_completion_correction_seeds_conversation(sc, monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"commits":[{"message":"feat: x","files":[1],"body":"","reasoning":"r"}]}'
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, url, headers, json):
+            captured["payload"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(sc.httpx, "Client", FakeClient)
+    cfg = sc.Config(model="m", api_key="k", base_url=sc.DEFAULT_API_BASE)
+    sc._request_completion(
+        cfg,
+        "system",
+        "user",
+        ["a.py"],
+        correction=('{"commits":[]}', "you dropped a.py"),
+    )
+    roles = [m["role"] for m in captured["payload"]["messages"]]
+    assert roles == ["system", "user", "assistant", "user"]
+    assert captured["payload"]["messages"][2]["content"] == '{"commits":[]}'
+    assert captured["payload"]["messages"][3]["content"] == "you dropped a.py"
+
+
+def test_repair_round_fixes_dropped_file_and_commits(tmp_git_repo, sc, monkeypatch, capsys):
+    """The exact failure mode this was built for: the model omits a staged
+    artifact deletion, the repair round assigns it, and the run proceeds."""
+    artifact = tmp_git_repo / "build" / "junk.bin"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"\x00generated")
+    subprocess.run(
+        ["git", "add", "build/junk.bin"], cwd=tmp_git_repo, check=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "track generated artifact"],
+        cwd=tmp_git_repo,
+        check=True,
+    )
+    artifact.unlink()
+    stage_files(tmp_git_repo, {"a.py": "1\n"})
+    subprocess.run(
+        ["git", "add", "-u", "build/junk.bin"], cwd=tmp_git_repo, check=True
+    )
+    usage = sc.Usage(input_tokens=100, output_tokens=10, cost_usd=0.001)
+    calls: dict = {}
+
+    def fake(config, diff, files, recent_log):
+        return [sc.CommitGroup(message="feat: a", files=["a.py"])], usage
+
+    def fake_repair(config, diff, files, recent_log, groups_in, errors):
+        calls["errors"] = errors
+        calls["groups_in"] = [g.message for g in groups_in]
+        return (
+            [
+                sc.CommitGroup(message="feat: a", files=["a.py"]),
+                sc.CommitGroup(
+                    message="chore: stop tracking build artifact",
+                    files=["build/junk.bin"],
+                ),
+            ],
+            usage,
+        )
+
+    monkeypatch.setattr(sc, "request_grouping", fake)
+    monkeypatch.setattr(sc, "request_grouping_repair", fake_repair)
+
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    assert any("build/junk.bin" in e for e in calls["errors"])
+    assert calls["groups_in"] == ["feat: a"]
+    subjects = commit_log_subjects(tmp_git_repo)
+    assert "feat: a" in subjects
+    assert "chore: stop tracking build artifact" in subjects
+    assert staged_files(tmp_git_repo) == []
+
+
+def test_repair_round_usage_is_added_to_total(tmp_git_repo, sc, monkeypatch, capsys):
+    stage_files(tmp_git_repo, {"a.py": "1\n", "b.py": "2\n"})
+
+    def fake(config, diff, files, recent_log):
+        return (
+            [sc.CommitGroup(message="feat: a", files=["a.py"])],
+            sc.Usage(input_tokens=100, output_tokens=10, cost_usd=0.001),
+        )
+
+    def fake_repair(config, diff, files, recent_log, groups_in, errors):
+        return (
+            [sc.CommitGroup(message="feat: a", files=["a.py", "b.py"])],
+            sc.Usage(input_tokens=250, output_tokens=25, cost_usd=0.002),
+        )
+
+    monkeypatch.setattr(sc, "request_grouping", fake)
+    monkeypatch.setattr(sc, "request_grouping_repair", fake_repair)
+
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_OK
+    out = capsys.readouterr().out
+    expected = sc.format_usage_line(
+        sc.Usage(input_tokens=350, output_tokens=35, cost_usd=0.003)
+    )
+    assert expected in out
+
+
+def test_repair_api_failure_falls_back_to_validation_error(tmp_git_repo, sc, monkeypatch, capsys):
+    stage_files(tmp_git_repo, {"a.py": "1\n", "b.py": "2\n"})
+
+    def fake(config, diff, files, recent_log):
+        return (
+            [sc.CommitGroup(message="feat: a", files=["a.py"])],
+            sc.Usage(input_tokens=1, output_tokens=1, cost_usd=0.0),
+        )
+
+    def boom(config, diff, files, recent_log, groups_in, errors):
+        raise sc.APICallError("upstream 500")
+
+    monkeypatch.setattr(sc, "request_grouping", fake)
+    monkeypatch.setattr(sc, "request_grouping_repair", boom)
+
+    initial = len(commit_log_subjects(tmp_git_repo))
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_VALIDATION_ERROR
+    assert len(commit_log_subjects(tmp_git_repo)) == initial
+    assert "repair attempt failed" in capsys.readouterr().err
+
+
+def test_repair_round_still_invalid_keeps_original_plan(tmp_git_repo, sc, monkeypatch, capsys):
+    stage_files(tmp_git_repo, {"a.py": "1\n", "b.py": "2\n"})
+
+    def fake(config, diff, files, recent_log):
+        return (
+            [sc.CommitGroup(message="feat: original", files=["a.py"])],
+            sc.Usage(input_tokens=1, output_tokens=1, cost_usd=0.0),
+        )
+
+    def fake_repair(config, diff, files, recent_log, groups_in, errors):
+        # Still drops b.py.
+        return (
+            [sc.CommitGroup(message="feat: repaired", files=["a.py"])],
+            sc.Usage(input_tokens=1, output_tokens=1, cost_usd=0.0),
+        )
+
+    monkeypatch.setattr(sc, "request_grouping", fake)
+    monkeypatch.setattr(sc, "request_grouping_repair", fake_repair)
+
+    rc = sc.main(["--auto"])
+    assert rc == sc.EXIT_VALIDATION_ERROR
+    assert "still invalid" in capsys.readouterr().err
+    assert sorted(staged_files(tmp_git_repo)) == ["a.py", "b.py"]
+
+
+def test_repair_round_runs_in_hunk_mode(tmp_git_repo, sc, monkeypatch):
+    _stage_multi_hunk_file(tmp_git_repo, "app.py")
+    usage = sc.Usage(input_tokens=1, output_tokens=1, cost_usd=0.0)
+
+    def fake(config, index, recent_log):
+        # app.py#2 unassigned -> validation error.
+        return [sc.CommitGroup(message="feat: a", files=["app.py"], hunks=["app.py#1"])], usage
+
+    def fake_repair(config, index, recent_log, groups_in, errors):
+        groups = [
+            sc.CommitGroup(message="feat: a", files=["app.py"], hunks=["app.py#1"]),
+            sc.CommitGroup(message="fix: b", files=["app.py"], hunks=["app.py#2"]),
+        ]
+        return groups, usage
+
+    monkeypatch.setattr(sc, "request_hunk_grouping", fake)
+    monkeypatch.setattr(sc, "request_hunk_grouping_repair", fake_repair)
+
+    rc = sc.main(["-p", "--auto"])
+    assert rc == sc.EXIT_OK
+    subjects = commit_log_subjects(tmp_git_repo)
+    assert "feat: a" in subjects
+    assert "fix: b" in subjects
